@@ -11,13 +11,14 @@ import androidx.appcompat.app.AppCompatActivity
 import androidx.core.content.ContextCompat
 import androidx.recyclerview.widget.LinearLayoutManager
 import android.Manifest
+import androidx.activity.ComponentActivity
 import com.abhi.connectapp.adapter.ConnectivityOptionAdapter
 import com.abhi.connectapp.connectivity.WifiDirectManager // Import the new manager
 import com.abhi.connectapp.databinding.ActivityMainBinding
 import com.abhi.connectapp.model.ConnectivityOption
 import com.abhi.connectapp.utils.Constants
 
-class MainActivity : AppCompatActivity() {
+class MainActivity : ComponentActivity() {
 
     private lateinit var binding: ActivityMainBinding
     private lateinit var requestPermissionLauncher: ActivityResultLauncher<Array<String>>
