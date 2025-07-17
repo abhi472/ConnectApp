@@ -134,20 +134,20 @@ If you accidentally deny any permissions, the app will prompt you with a dialog 
 
 Here are some screenshots illustrating the application's UI and connectivity states:
 
-* **BLE Device Discovery and Connection
-Screenshot: /screenshot/7.jpg
+* **BLE Device Discovery**
+Screenshot: `screenshot/7.jpg`
 
-Screenshot: /screenshot/5.jpg 
+Screenshot: `screenshot/5.jpg`
 
-Screenshot: /screenshot/2.jpg
+Screenshot: `screenshot/2.jpg`
 
 
-* **BLE Device Discovery and Connection
-Screenshot: /screenshot/9.jpg
+* **BLE Device Connection/Disconnection**
+Screenshot: `screenshot/9.jpg`
 
-Screenshot: /screenshot/1.jpg
+Screenshot: `screenshot/1.jpg`
 
-Screenshot: /screenshot/4.jpg
+Screenshot: `screenshot/4.jpg`
 
 
 This documentation should provide a solid guide for thoroughly testing your application's connectivity features.
