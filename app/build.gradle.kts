@@ -1,6 +1,7 @@
 plugins {
     alias(libs.plugins.android.application)
     alias(libs.plugins.kotlin.android)
+    alias(libs.plugins.kotlinParcelize)
     alias(libs.plugins.kotlin.compose)
 }
 
@@ -31,12 +32,13 @@ android {
         sourceCompatibility = JavaVersion.VERSION_11
         targetCompatibility = JavaVersion.VERSION_11
     }
-    kotlinOptions {
-        jvmTarget = "11"
-    }
     buildFeatures {
         dataBinding = true
     }
+}
+
+kotlin {
+    jvmToolchain(11) // Set the JDK toolchain for Kotlin compilation
 }
 
 dependencies {

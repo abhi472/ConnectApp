@@ -1,6 +1,4 @@
-package com.abhi.connectapp;
-
-
+package com.abhi.connectapp
 
 import android.Manifest
 import android.annotation.SuppressLint
@@ -13,6 +11,9 @@ import android.content.Context
 import android.content.Intent
 import android.content.IntentFilter
 import android.content.pm.PackageManager
+import android.net.wifi.WifiManager
+import android.net.wifi.p2p.WifiP2pDevice
+import android.net.wifi.p2p.WifiP2pManager
 import android.os.Build
 import android.os.Bundle
 import android.provider.Settings
@@ -26,13 +27,19 @@ import androidx.appcompat.app.AppCompatActivity
 import androidx.core.content.ContextCompat
 import androidx.recyclerview.widget.LinearLayoutManager
 import com.abhi.connectapp.adapter.DeviceAdapter
+import com.abhi.connectapp.connectivity.BLEManager
 import com.abhi.connectapp.connectivity.BluetoothClassicManager
-import com.abhi.connectapp.connectivity.ConnectionCallback
+import com.abhi.connectapp.connectivity.ConnectionState
+import com.abhi.connectapp.connectivity.WiFiDirectBroadcastReceiver // Import the new Wi-Fi Direct Broadcast Receiver
+import com.abhi.connectapp.connectivity.WifiDirectManager // Import the new Wi-Fi Direct Manager
 import com.abhi.connectapp.databinding.ActivityDeviceListBinding
 import com.abhi.connectapp.model.Device
 import com.abhi.connectapp.utils.Constants
 
+
 class DeviceListActivity : AppCompatActivity() {
+
+    private val TAG = "DeviceListActivity" // Added TAG for consistent logging
 
     private lateinit var binding: ActivityDeviceListBinding
     private lateinit var deviceAdapter: DeviceAdapter
@@ -40,16 +47,20 @@ class DeviceListActivity : AppCompatActivity() {
 
     // Bluetooth Classic specific
     private var bluetoothAdapter: BluetoothAdapter? = null
-    private lateinit var bluetoothClassicManager: BluetoothClassicManager
+
+    // Wi-Fi Direct specific
+    private var wifiManager: WifiManager? = null
+    // No longer need to declare wifiP2pManager and wifiP2pChannel here,
+    // as we access them via WifiDirectManager.wifiP2pManager and WifiDirectManager.channel
+    private lateinit var wifiDirectReceiver: WiFiDirectBroadcastReceiver
+    private val wifiDirectIntentFilter = IntentFilter()
+
 
     // BroadcastReceiver for Bluetooth Classic discovery
     private val bluetoothDiscoveryReceiver = object : BroadcastReceiver() {
-        @SuppressLint("MissingPermission")
         override fun onReceive(context: Context?, intent: Intent?) {
             when (intent?.action) {
                 BluetoothDevice.ACTION_FOUND -> {
-                    // Requires BLUETOOTH_SCAN permission (handled by check in startScanningBluetoothClassic)
-                    // and BLUETOOTH_CONNECT permission to get device.name/address
                     val device: BluetoothDevice? =
                         if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.TIRAMISU) {
                             intent.getParcelableExtra(BluetoothDevice.EXTRA_DEVICE, BluetoothDevice::class.java)
@@ -58,18 +69,15 @@ class DeviceListActivity : AppCompatActivity() {
                             intent.getParcelableExtra(BluetoothDevice.EXTRA_DEVICE)
                         }
                     device?.let {
-                        // Accessing device.name/address here is generally safe because ACTION_FOUND implies
-                        // the device object is valid and the system has done initial permission checks.
-                        // However, the `BluetoothClassicManager` itself will re-check BLUETOOTH_CONNECT for internal calls.
-                        val deviceName = it.name ?: "N/A"
+                        val deviceName = if (checkBluetoothConnectPermission()) it.name else "Unknown Device"
                         val deviceAddress = it.address
-                        Log.d("DeviceListActivity", "Found device: $deviceName ($deviceAddress)")
+                        Log.d(TAG, "Found Classic device: $deviceName ($deviceAddress)")
                         deviceAdapter.addDevice(Device(deviceName, deviceAddress, Constants.CONNECTION_TYPE_BLUETOOTH_CLASSIC))
                     }
                 }
                 BluetoothAdapter.ACTION_DISCOVERY_FINISHED -> {
                     stopScanning()
-                    Toast.makeText(context, "Bluetooth discovery finished.", Toast.LENGTH_SHORT).show()
+                    Toast.makeText(context, "Bluetooth Classic discovery finished.", Toast.LENGTH_SHORT).show()
                 }
             }
         }
@@ -79,13 +87,34 @@ class DeviceListActivity : AppCompatActivity() {
     private val requestBluetoothEnableLauncher = registerForActivityResult(ActivityResultContracts.StartActivityForResult()) { result ->
         if (result.resultCode == Activity.RESULT_OK) {
             Toast.makeText(this, "Bluetooth is enabled.", Toast.LENGTH_SHORT).show()
-            // If permissions are already granted, start scan
-            if (checkBluetoothClassicPermissions()) {
-                startScanningBluetoothClassic()
+            when (connectionType) {
+                Constants.CONNECTION_TYPE_BLUETOOTH_CLASSIC -> {
+                    if (checkBluetoothClassicPermissions()) {
+                        startScanningBluetoothClassic()
+                    }
+                }
+                Constants.CONNECTION_TYPE_BLE -> {
+                    if (checkBLEPermissions()) {
+                        startScanningBLE()
+                    }
+                }
             }
         } else {
             Toast.makeText(this, "Bluetooth not enabled. Cannot scan.", Toast.LENGTH_LONG).show()
-            finish() // Or keep user on page with a warning
+            finish()
+        }
+    }
+
+    private val requestWifiEnableLauncher = registerForActivityResult(ActivityResultContracts.StartActivityForResult()) { result ->
+        if (result.resultCode == Activity.RESULT_OK) {
+            Toast.makeText(this, "Wi-Fi is enabled.", Toast.LENGTH_SHORT).show()
+            // After Wi-Fi is enabled, proceed with Wi-Fi Direct scan
+            if (checkWifiDirectPermissions()) {
+                startScanningWifiDirect()
+            }
+        } else {
+            Toast.makeText(this, "Wi-Fi not enabled. Cannot use Wi-Fi Direct.", Toast.LENGTH_LONG).show()
+            finish()
         }
     }
 
@@ -101,23 +130,24 @@ class DeviceListActivity : AppCompatActivity() {
 
         setupRecyclerView()
         setupPermissionLauncher()
-        setupBluetooth() // This will now pass 'this' (Context)
+        setupBluetoothAdapters() // Initialize Bluetooth Classic and BLE
+        setupWifiDirect() // Initialize Wi-Fi Direct components
         setupScanButton()
+        observeConnectionState() // Observe LiveData for connection state changes for all managers
+        observeBleScanResults() // Observe LiveData for BLE scan results
+        observeWifiDirectPeers() // New: Observe LiveData for Wi-Fi Direct peers
+        observeWifiDirectState() // New: Observe Wi-Fi Direct enabled/disabled state
+        observeWifiDirectConnectionInfo() // New: Observe Wi-Fi Direct connection info
 
-        // Based on connection type, start initial process or show prompt
         when (connectionType) {
             Constants.CONNECTION_TYPE_BLUETOOTH_CLASSIC -> {
                 requestBluetoothClassicPermissionsAndScan()
             }
             Constants.CONNECTION_TYPE_BLE -> {
-                // Implement BLE setup and scanning later
-                binding.tvStatusMessage.text = "BLE scanning not yet implemented."
-                binding.tvStatusMessage.visibility = View.VISIBLE
+                requestBLEPermissionsAndScan()
             }
-            Constants.CONNECTION_TYPE_WIFI -> {
-                // Implement Wi-Fi Direct setup and scanning later
-                binding.tvStatusMessage.text = "Wi-Fi Direct not yet implemented."
-                binding.tvStatusMessage.visibility = View.VISIBLE
+            Constants.CONNECTION_TYPE_WIFI_DIRECT -> {
+                requestWifiDirectPermissionsAndScan()
             }
             else -> {
                 Toast.makeText(this, "Invalid connection type.", Toast.LENGTH_SHORT).show()
@@ -126,13 +156,97 @@ class DeviceListActivity : AppCompatActivity() {
         }
     }
 
+    override fun onResume() {
+        super.onResume()
+        // Register receivers
+        when (connectionType) {
+            Constants.CONNECTION_TYPE_BLUETOOTH_CLASSIC -> {
+                val filter = IntentFilter().apply {
+                    addAction(BluetoothDevice.ACTION_FOUND)
+                    addAction(BluetoothAdapter.ACTION_DISCOVERY_FINISHED)
+                }
+                registerReceiver(bluetoothDiscoveryReceiver, filter)
+            }
+            Constants.CONNECTION_TYPE_WIFI_DIRECT -> {
+                // Ensure WifiP2pManager and Channel are initialized before registering receiver
+                // Access manager and channel directly from the singleton object
+                val manager = WifiDirectManager.wifiP2pManager
+                val channel = WifiDirectManager.channel
+
+                if (manager != null && channel != null) {
+                    wifiDirectReceiver = WiFiDirectBroadcastReceiver(manager, channel)
+                    registerReceiver(wifiDirectReceiver, wifiDirectIntentFilter)
+                } else {
+                    Log.e(TAG, "WifiP2pManager or Channel is null during onResume for Wi-Fi Direct.")
+                    Toast.makeText(this, "Wi-Fi Direct not ready. Restart app.", Toast.LENGTH_LONG).show()
+                    finish()
+                }
+            }
+        }
+    }
+
+    override fun onPause() {
+        super.onPause()
+        // Unregister receivers
+        when (connectionType) {
+            Constants.CONNECTION_TYPE_BLUETOOTH_CLASSIC -> {
+                try {
+                    unregisterReceiver(bluetoothDiscoveryReceiver)
+                } catch (e: IllegalArgumentException) {
+                    Log.w(TAG, "Bluetooth discovery receiver not registered or already unregistered: ${e.message}")
+                }
+            }
+            Constants.CONNECTION_TYPE_WIFI_DIRECT -> {
+                try {
+                    unregisterReceiver(wifiDirectReceiver)
+                } catch (e: IllegalArgumentException) {
+                    Log.w(TAG, "Wi-Fi Direct receiver not registered or already unregistered: ${e.message}")
+                }
+            }
+        }
+    }
+
+
+    override fun onDestroy() {
+        super.onDestroy()
+        // Ensure classic discovery is stopped with permission check
+        if (checkBluetoothScanPermission()) {
+            bluetoothAdapter?.cancelDiscovery()
+        }
+        BLEManager.stopScan() // Ensure BLE scan is stopped
+        BLEManager.close() // Close BLE resources
+        BluetoothClassicManager.stop() // Stop Classic BT resources
+        WifiDirectManager.close() // Close Wi-Fi Direct resources
+    }
+
     private fun setupRecyclerView() {
         deviceAdapter = DeviceAdapter { device ->
-            // Handle device selection for connection
-            Toast.makeText(this, "Selected: ${device.name}", Toast.LENGTH_SHORT).show()
-            when (connectionType) {
-                Constants.CONNECTION_TYPE_BLUETOOTH_CLASSIC -> connectToBluetoothClassicDevice(device.address)
-                // Add BLE and Wi-Fi connection initiation here later
+            Toast.makeText(this, "Selected: ${device.name} (${device.address})", Toast.LENGTH_SHORT).show()
+            when (device.type) { // Use device.type to determine connection logic
+                Constants.CONNECTION_TYPE_BLUETOOTH_CLASSIC -> {
+                    val remoteDevice = if (checkBluetoothConnectPermission()) bluetoothAdapter?.getRemoteDevice(device.address) else null
+                    if (remoteDevice != null) {
+                        BluetoothClassicManager.connect(remoteDevice)
+                    } else {
+                        Toast.makeText(this, "Could not get remote device for Classic or permission missing.", Toast.LENGTH_SHORT).show()
+                    }
+                }
+                Constants.CONNECTION_TYPE_BLE -> {
+                    val remoteDevice = if (checkBluetoothConnectPermission()) bluetoothAdapter?.getRemoteDevice(device.address) else null
+                    if (remoteDevice != null) {
+                        BLEManager.connect(remoteDevice)
+                    } else {
+                        Toast.makeText(this, "Could not get remote device for BLE or permission missing.", Toast.LENGTH_SHORT).show()
+                    }
+                }
+                Constants.CONNECTION_TYPE_WIFI_DIRECT -> {
+                    val wifiP2pDevice = WifiDirectManager.peers.value?.find { it.deviceAddress == device.address }
+                    if (wifiP2pDevice != null) {
+                        WifiDirectManager.connectToDevice(wifiP2pDevice)
+                    } else {
+                        Toast.makeText(this, "Wi-Fi Direct device not found in current scan results.", Toast.LENGTH_SHORT).show()
+                    }
+                }
             }
         }
         binding.rvDevices.layoutManager = LinearLayoutManager(this)
@@ -151,7 +265,7 @@ class DeviceListActivity : AppCompatActivity() {
                 showPermissionDeniedDialog(deniedPermissions)
             } else {
                 Toast.makeText(this, "All required permissions granted!", Toast.LENGTH_SHORT).show()
-                // Permissions are granted, proceed based on connection type
+                // Based on connection type, proceed with scan
                 when (connectionType) {
                     Constants.CONNECTION_TYPE_BLUETOOTH_CLASSIC -> {
                         if (bluetoothAdapter?.isEnabled == true) {
@@ -160,7 +274,21 @@ class DeviceListActivity : AppCompatActivity() {
                             promptEnableBluetooth()
                         }
                     }
-                    // Add logic for BLE and WiFi permissions here (e.g., requestLocationPermissionForBLE, requestWifiDirectPermissions)
+                    Constants.CONNECTION_TYPE_BLE -> {
+                        if (bluetoothAdapter?.isEnabled == true) {
+                            startScanningBLE()
+                        } else {
+                            promptEnableBluetooth()
+                        }
+                    }
+                    Constants.CONNECTION_TYPE_WIFI_DIRECT -> {
+                        // For Wi-Fi Direct, check if Wi-Fi itself is enabled
+                        if (wifiManager?.isWifiEnabled == true) {
+                            startScanningWifiDirect()
+                        } else {
+                            promptEnableWifi()
+                        }
+                    }
                 }
             }
         }
@@ -179,7 +307,7 @@ class DeviceListActivity : AppCompatActivity() {
             }
             .setNegativeButton("Cancel") { dialog, _ ->
                 dialog.dismiss()
-                finish() // Cannot proceed without permissions
+                finish()
             }
             .setCancelable(false)
             .show()
@@ -187,112 +315,219 @@ class DeviceListActivity : AppCompatActivity() {
 
     private fun setupScanButton() {
         binding.btnScanDevices.setOnClickListener {
-            // Clear existing devices and re-scan based on the current connection type
             deviceAdapter.clearDevices()
             when (connectionType) {
                 Constants.CONNECTION_TYPE_BLUETOOTH_CLASSIC -> requestBluetoothClassicPermissionsAndScan()
-                // Add BLE and Wi-Fi direct scan initiation here
+                Constants.CONNECTION_TYPE_BLE -> requestBLEPermissionsAndScan()
+                Constants.CONNECTION_TYPE_WIFI_DIRECT -> requestWifiDirectPermissionsAndScan()
             }
         }
     }
 
-    // --- Bluetooth Classic Specific Functions ---
-    private fun setupBluetooth() {
+    // --- Common Bluetooth Initialization ---
+    private fun setupBluetoothAdapters() {
         val bluetoothManager = getSystemService(Context.BLUETOOTH_SERVICE) as BluetoothManager
         bluetoothAdapter = bluetoothManager.adapter
         if (bluetoothAdapter == null) {
             Toast.makeText(this, "Device doesn't support Bluetooth.", Toast.LENGTH_LONG).show()
-            finish()
+            // Don't finish if other connection types are supported
         }
-        // MODIFICATION: Pass 'this' (the Context) to the BluetoothClassicManager constructor
-        bluetoothClassicManager = BluetoothClassicManager(this, bluetoothAdapter!!, object :
-            ConnectionCallback {
-            override fun onConnectionAttempt(deviceName: String) {
-                runOnUiThread {
-                    Toast.makeText(this@DeviceListActivity, "Attempting to connect to $deviceName...", Toast.LENGTH_SHORT).show()
-                    binding.tvStatusMessage.text = "Connecting to $deviceName..."
-                    binding.tvStatusMessage.visibility = View.VISIBLE
-                    binding.progressBarScanning.visibility = View.VISIBLE
-                }
-            }
-
-            @SuppressLint("MissingPermission")
-            override fun onConnectionSuccess(device: BluetoothDevice) {
-                runOnUiThread {
-                    Toast.makeText(this@DeviceListActivity, "Connected to ${device.name}", Toast.LENGTH_SHORT).show()
-                    binding.tvStatusMessage.text = "Connected to ${device.name}"
-                    binding.progressBarScanning.visibility = View.GONE
-                    // Navigate to Page C (data exchange page)
-                    val intent = Intent(this@DeviceListActivity, PageCActivity::class.java).apply {
-                        // Pass device info. Note: device.name might still require BLUETOOTH_CONNECT if not already checked.
-                        // However, since we're already connected, it should be fine.
-                        putExtra("device_name", device.name)
-                        putExtra("device_address", device.address)
-                        putExtra("connection_type", Constants.CONNECTION_TYPE_BLUETOOTH_CLASSIC)
-                        // IMPORTANT: For `PageCActivity` to send/receive data, it needs a reference to the `ConnectedThread`
-                        // or a way to interact with `bluetoothClassicManager`. This typically involves:
-                        // 1. Making `bluetoothClassicManager` a singleton (e.g., using object or dependency injection).
-                        // 2. Using a shared ViewModel/repository pattern.
-                        // We will address this in the `PageCActivity` implementation.
-                    }
-                    startActivity(intent)
-                    // Consider finishing this activity or keeping it in backstack based on UX
-                    finish() // Finish DeviceListActivity as connection is established.
-                }
-            }
-
-            override  fun onConnectionFailed(deviceName: String, error: String) {
-                runOnUiThread {
-                    Toast.makeText(this@DeviceListActivity, "Failed to connect to $deviceName: $error", Toast.LENGTH_LONG).show()
-                    binding.tvStatusMessage.text = "Connection failed to $deviceName: $error"
-                    binding.progressBarScanning.visibility = View.GONE
-                    // Re-enable scan button or suggest retry
-                }
-            }
-
-            override fun onDataReceived(data: String) {
-                // This callback is primarily for PageCActivity. Logging here for debug.
-                Log.d("DeviceListActivity", "Data received (should be handled in PageC): $data")
-            }
-        })
+        // Initialize both Bluetooth managers
+        bluetoothAdapter?.let { adapter ->
+            BluetoothClassicManager.init(applicationContext, adapter)
+            BLEManager.init(applicationContext, adapter)
+        }
     }
 
-    // Checks if the necessary Bluetooth Classic permissions are granted
+    // --- Wi-Fi Direct Initialization ---
+    private fun setupWifiDirect() {
+        // Get WifiManager for checking Wi-Fi state
+        wifiManager = applicationContext.getSystemService(Context.WIFI_SERVICE) as? WifiManager
+
+        // Initialize WifiDirectManager (already done in MainActivity, but safe to call again)
+        WifiDirectManager.init(applicationContext)
+
+        // Prepare IntentFilter for Wi-Fi Direct BroadcastReceiver
+        wifiDirectIntentFilter.addAction(WifiP2pManager.WIFI_P2P_STATE_CHANGED_ACTION)
+        wifiDirectIntentFilter.addAction(WifiP2pManager.WIFI_P2P_PEERS_CHANGED_ACTION)
+        wifiDirectIntentFilter.addAction(WifiP2pManager.WIFI_P2P_CONNECTION_CHANGED_ACTION)
+        wifiDirectIntentFilter.addAction(WifiP2pManager.WIFI_P2P_THIS_DEVICE_CHANGED_ACTION)
+
+        // The receiver will be instantiated and registered in onResume
+    }
+
+    // --- Observe Connection States for all Managers ---
+    private fun observeConnectionState() {
+        BluetoothClassicManager.connectionState.observe(this) { (state, message) ->
+            if (connectionType == Constants.CONNECTION_TYPE_BLUETOOTH_CLASSIC) {
+                updateUIForConnectionState(state, message)
+            }
+        }
+        BLEManager.bleConnectionState.observe(this) { (state, message) ->
+            if (connectionType == Constants.CONNECTION_TYPE_BLE) {
+                updateUIForConnectionState(state, message)
+            }
+        }
+        WifiDirectManager.connectionState.observe(this) { (state, message) ->
+            if (connectionType == Constants.CONNECTION_TYPE_WIFI_DIRECT) {
+                updateUIForConnectionState(state, message)
+            }
+        }
+    }
+
+    private fun updateUIForConnectionState(state: ConnectionState, message: String?) {
+        when (state) {
+            ConnectionState.CONNECTING -> {
+                Toast.makeText(this, "Attempting to connect to $message...", Toast.LENGTH_SHORT).show()
+                binding.tvStatusMessage.text = "Connecting to $message..."
+                binding.tvStatusMessage.visibility = View.VISIBLE
+                binding.progressBarScanning.visibility = View.VISIBLE
+            }
+            ConnectionState.CONNECTED -> {
+                Toast.makeText(this, "Connected to $message", Toast.LENGTH_SHORT).show()
+                binding.tvStatusMessage.text = "Connected to $message"
+                binding.progressBarScanning.visibility = View.GONE
+
+                // For Wi-Fi Direct, explicitly request connection info to get GO IP
+                if (connectionType == Constants.CONNECTION_TYPE_WIFI_DIRECT) {
+                    // This callback will trigger onConnectionInfoAvailable, which then navigates
+                    WifiDirectManager.requestConnectionInfo()
+                } else {
+                    // Navigate for Bluetooth Classic and BLE
+                    navigateToPageC(message)
+                }
+            }
+            ConnectionState.FAILED -> {
+                Toast.makeText(this, "Connection failed: ${message ?: "Unknown error"}", Toast.LENGTH_LONG).show()
+                binding.tvStatusMessage.text = "Connection failed: ${message ?: "Unknown error"}"
+                binding.progressBarScanning.visibility = View.GONE
+            }
+            ConnectionState.DISCONNECTED -> {
+                Toast.makeText(this, "Disconnected: ${message ?: ""}", Toast.LENGTH_SHORT).show()
+                binding.tvStatusMessage.text = "Disconnected."
+                binding.progressBarScanning.visibility = View.GONE
+                // Clear devices on disconnect for all types
+                deviceAdapter.clearDevices()
+            }
+        }
+    }
+
+    // New: Handle navigation to PageC once connection info is available for Wi-Fi Direct
+    private fun navigateToPageC(deviceName: String?) {
+        val intent = Intent(this@DeviceListActivity, PageCActivity::class.java).apply {
+            putExtra("device_name", deviceName)
+            putExtra("connection_type", connectionType)
+        }
+        startActivity(intent)
+        finish()
+    }
+
+
+    // --- Observe BLE Scan Results ---
+    @SuppressLint("MissingPermission")
+    private fun observeBleScanResults() {
+        BLEManager.bleScanResults.observe(this) { bleDevices ->
+            if (connectionType == Constants.CONNECTION_TYPE_BLE) {
+                deviceAdapter.clearDevices()
+                bleDevices.forEach {
+                    deviceAdapter.addDevice(Device(it.name ?: "Unknown BLE Device", it.address, Constants.CONNECTION_TYPE_BLE))
+                }
+            }
+        }
+    }
+
+    // --- New: Observe Wi-Fi Direct Peers ---
+    private fun observeWifiDirectPeers() {
+        WifiDirectManager.peers.observe(this) { wifiP2pDevices ->
+            if (connectionType == Constants.CONNECTION_TYPE_WIFI_DIRECT) {
+                deviceAdapter.clearDevices()
+                wifiP2pDevices.forEach {
+                    deviceAdapter.addDevice(Device(it.deviceName ?: "Unknown Wi-Fi Direct Device", it.deviceAddress, Constants.CONNECTION_TYPE_WIFI_DIRECT))
+                }
+                if (wifiP2pDevices.isEmpty()) {
+                    binding.tvStatusMessage.text = "No Wi-Fi Direct peers found. Keep scanning..."
+                } else {
+                    binding.tvStatusMessage.text = "Found ${wifiP2pDevices.size} Wi-Fi Direct peers."
+                }
+            }
+        }
+    }
+
+    // New: Observe Wi-Fi Direct State (Enabled/Disabled)
+    private fun observeWifiDirectState() {
+        WifiDirectManager.wifiDirectState.observe(this) { isEnabled ->
+            if (connectionType == Constants.CONNECTION_TYPE_WIFI_DIRECT) {
+                if (isEnabled) {
+                    Toast.makeText(this, "Wi-Fi Direct is ON.", Toast.LENGTH_SHORT).show()
+                    binding.tvStatusMessage.text = "Wi-Fi Direct is ON. Ready to scan."
+                } else {
+                    Toast.makeText(this, "Wi-Fi Direct is OFF. Please enable Wi-Fi.", Toast.LENGTH_LONG).show()
+                    binding.tvStatusMessage.text = "Wi-Fi Direct is OFF."
+                    deviceAdapter.clearDevices()
+                }
+            }
+        }
+    }
+
+    // New: Observe Wi-Fi Direct Connection Info (crucial for socket setup)
+    private fun observeWifiDirectConnectionInfo() {
+        WifiDirectManager.connectionInfo.observe(this) { info ->
+            if (connectionType == Constants.CONNECTION_TYPE_WIFI_DIRECT) {
+                if (info.groupFormed) {
+                    val connectedToName = if (info.isGroupOwner) "Clients" else info.groupOwnerAddress.hostAddress
+                    Toast.makeText(this, "Wi-Fi Direct Group Formed! GO: ${info.groupOwnerAddress.hostAddress}", Toast.LENGTH_LONG).show()
+                    binding.tvStatusMessage.text = "Connected via Wi-Fi Direct to ${connectedToName}"
+                    binding.progressBarScanning.visibility = View.GONE
+
+                    // THIS IS WHERE THE "CONNECTION IN BOTH APPS" LOGIC IS FULFILLED
+                    // Both devices will receive this callback.
+                    // Now, you can proceed to set up your TCP/IP sockets for data transfer.
+                    // For now, we navigate to PageC, passing the GO's address as the "device name"
+                    navigateToPageC(info.groupOwnerAddress.hostAddress)
+                } else {
+                    // This state might occur if group formation fails after connection attempt
+                    Toast.makeText(this, "Wi-Fi Direct group not formed.", Toast.LENGTH_LONG).show()
+                    binding.tvStatusMessage.text = "Wi-Fi Direct group not formed."
+                    binding.progressBarScanning.visibility = View.GONE
+                }
+            }
+        }
+    }
+
+
+    // --- Bluetooth Classic Permissions & Scan ---
+    private fun checkBluetoothConnectPermission(): Boolean {
+        return ContextCompat.checkSelfPermission(this, Manifest.permission.BLUETOOTH_CONNECT) == PackageManager.PERMISSION_GRANTED
+    }
+
+    private fun checkBluetoothScanPermission(): Boolean {
+        return ContextCompat.checkSelfPermission(this, Manifest.permission.BLUETOOTH_SCAN) == PackageManager.PERMISSION_GRANTED
+    }
+
     private fun checkBluetoothClassicPermissions(): Boolean {
         val permissions = mutableListOf<String>()
-        if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.S) { // Android 12+
+        if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.S) {
             permissions.add(Manifest.permission.BLUETOOTH_SCAN)
             permissions.add(Manifest.permission.BLUETOOTH_CONNECT)
-            permissions.add(Manifest.permission.BLUETOOTH_ADVERTISE) // Needed if this device will act as a server
+            permissions.add(Manifest.permission.BLUETOOTH_ADVERTISE)
         }
-        // Location is needed for scanning on Android 6.0+
         permissions.add(Manifest.permission.ACCESS_FINE_LOCATION)
 
         return permissions.all { ContextCompat.checkSelfPermission(this, it) == PackageManager.PERMISSION_GRANTED }
     }
 
-    // Requests Bluetooth Classic specific permissions or proceeds if already granted
     private fun requestBluetoothClassicPermissionsAndScan() {
         val permissionsToRequest = mutableListOf<String>()
         if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.S) {
-            if (ContextCompat.checkSelfPermission(this, Manifest.permission.BLUETOOTH_SCAN) != PackageManager.PERMISSION_GRANTED) {
-                permissionsToRequest.add(Manifest.permission.BLUETOOTH_SCAN)
-            }
-            if (ContextCompat.checkSelfPermission(this, Manifest.permission.BLUETOOTH_CONNECT) != PackageManager.PERMISSION_GRANTED) {
-                permissionsToRequest.add(Manifest.permission.BLUETOOTH_CONNECT)
-            }
-            if (ContextCompat.checkSelfPermission(this, Manifest.permission.BLUETOOTH_ADVERTISE) != PackageManager.PERMISSION_GRANTED) {
-                permissionsToRequest.add(Manifest.permission.BLUETOOTH_ADVERTISE)
-            }
+            if (!checkBluetoothScanPermission()) permissionsToRequest.add(Manifest.permission.BLUETOOTH_SCAN)
+            if (!checkBluetoothConnectPermission()) permissionsToRequest.add(Manifest.permission.BLUETOOTH_CONNECT)
+            if (ContextCompat.checkSelfPermission(this, Manifest.permission.BLUETOOTH_ADVERTISE) != PackageManager.PERMISSION_GRANTED) permissionsToRequest.add(Manifest.permission.BLUETOOTH_ADVERTISE)
         }
-        if (ContextCompat.checkSelfPermission(this, Manifest.permission.ACCESS_FINE_LOCATION) != PackageManager.PERMISSION_GRANTED) {
-            permissionsToRequest.add(Manifest.permission.ACCESS_FINE_LOCATION)
-        }
+        if (ContextCompat.checkSelfPermission(this, Manifest.permission.ACCESS_FINE_LOCATION) != PackageManager.PERMISSION_GRANTED) permissionsToRequest.add(Manifest.permission.ACCESS_FINE_LOCATION)
 
         if (permissionsToRequest.isNotEmpty()) {
             requestPermissionLauncher.launch(permissionsToRequest.toTypedArray())
         } else {
-            // All permissions are already granted
             if (bluetoothAdapter?.isEnabled == true) {
                 startScanningBluetoothClassic()
             } else {
@@ -301,23 +536,14 @@ class DeviceListActivity : AppCompatActivity() {
         }
     }
 
-    // Prompts the user to enable Bluetooth if it's off
-    private fun promptEnableBluetooth() {
-        val enableBtIntent = Intent(BluetoothAdapter.ACTION_REQUEST_ENABLE)
-        requestBluetoothEnableLauncher.launch(enableBtIntent)
-    }
-
-    // Starts the Bluetooth Classic device discovery process
+    @SuppressLint("MissingPermission") // Permissions are checked before calling this
     private fun startScanningBluetoothClassic() {
+        // Stop other scans
+        BLEManager.stopScan()
+        WifiDirectManager.disconnect() // Stop any active Wi-Fi Direct connection/discovery
+
         if (bluetoothAdapter?.isDiscovering == true) {
-            // If already discovering, cancel it before starting a new one
-            if (ContextCompat.checkSelfPermission(this, Manifest.permission.BLUETOOTH_SCAN) == PackageManager.PERMISSION_GRANTED) {
-                bluetoothAdapter?.cancelDiscovery()
-            } else {
-                Log.e("DeviceListActivity", "BLUETOOTH_SCAN permission not granted for cancelDiscovery.")
-                Toast.makeText(this, "Permission missing to stop previous scan.", Toast.LENGTH_SHORT).show()
-                return
-            }
+            bluetoothAdapter?.cancelDiscovery()
         }
 
         deviceAdapter.clearDevices()
@@ -325,71 +551,128 @@ class DeviceListActivity : AppCompatActivity() {
         binding.tvStatusMessage.visibility = View.VISIBLE
         binding.progressBarScanning.visibility = View.VISIBLE
 
-        // Register for broadcasts when a device is found or discovery finishes
         val filter = IntentFilter().apply {
             addAction(BluetoothDevice.ACTION_FOUND)
             addAction(BluetoothAdapter.ACTION_DISCOVERY_FINISHED)
         }
-        // Context.registerReceiver() requires the appropriate permissions.
-        // ACTION_FOUND implicitly requires BLUETOOTH_SCAN.
         registerReceiver(bluetoothDiscoveryReceiver, filter)
 
-        // Start discovery (this is asynchronous)
-        if (ContextCompat.checkSelfPermission(this, Manifest.permission.BLUETOOTH_SCAN) == PackageManager.PERMISSION_GRANTED) {
-            bluetoothAdapter?.startDiscovery()
-            Toast.makeText(this, "Bluetooth discovery started.", Toast.LENGTH_SHORT).show()
-        } else {
-            Toast.makeText(this, "Bluetooth scan permission not granted. Cannot start discovery.", Toast.LENGTH_SHORT).show()
-            stopScanning()
-        }
+        bluetoothAdapter?.startDiscovery()
+        Toast.makeText(this, "Bluetooth discovery started.", Toast.LENGTH_SHORT).show()
     }
 
-    // Stops the Bluetooth Classic discovery process
-    private fun stopScanning() {
-        if (bluetoothAdapter?.isDiscovering == true) {
-            if (ContextCompat.checkSelfPermission(this, Manifest.permission.BLUETOOTH_SCAN) == PackageManager.PERMISSION_GRANTED) {
-                bluetoothAdapter?.cancelDiscovery()
-            } else {
-                Log.e("DeviceListActivity", "BLUETOOTH_SCAN permission not granted to cancel discovery.")
-            }
+    @SuppressLint("MissingPermission") // Permissions are checked before calling this
+    private fun stopScanning() { // This method stops Classic BT discovery
+        if (checkBluetoothScanPermission() && bluetoothAdapter?.isDiscovering == true) {
+            bluetoothAdapter?.cancelDiscovery()
+        } else {
+            Log.e(TAG, "Cannot stop Classic BT scan: Permission missing or not discovering.")
         }
         binding.progressBarScanning.visibility = View.GONE
-        binding.tvStatusMessage.visibility = View.GONE // Or set to "Scan finished"
+        binding.tvStatusMessage.visibility = View.GONE
     }
 
-    // Initiates connection to a selected Bluetooth Classic device
-    private fun connectToBluetoothClassicDevice(address: String) {
-        // Ensure BLUETOOTH_CONNECT permission is held before calling getRemoteDevice.
-        // Although getRemoteDevice itself doesn't require it, subsequent socket operations do.
-        // We rely on the initial permission check when starting the activity.
-        if (ContextCompat.checkSelfPermission(this, Manifest.permission.BLUETOOTH_CONNECT) != PackageManager.PERMISSION_GRANTED) {
-            Toast.makeText(this, "BLUETOOTH_CONNECT permission not granted to initiate connection.", Toast.LENGTH_SHORT).show()
-            return
-        }
+    private fun promptEnableBluetooth() {
+        val enableBtIntent = Intent(BluetoothAdapter.ACTION_REQUEST_ENABLE)
+        requestBluetoothEnableLauncher.launch(enableBtIntent)
+    }
 
-        val device = bluetoothAdapter?.getRemoteDevice(address)
-        if (device != null) {
-            stopScanning() // Stop discovery before attempting connection
-            bluetoothClassicManager.connect(device)
+
+    // --- BLE Permissions & Scan ---
+    private fun checkBLEPermissions(): Boolean {
+        val permissions = mutableListOf<String>()
+        if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.S) {
+            permissions.add(Manifest.permission.BLUETOOTH_SCAN)
+            permissions.add(Manifest.permission.BLUETOOTH_CONNECT)
+        }
+        permissions.add(Manifest.permission.ACCESS_FINE_LOCATION)
+
+        return permissions.all { ContextCompat.checkSelfPermission(this, it) == PackageManager.PERMISSION_GRANTED }
+    }
+
+    private fun requestBLEPermissionsAndScan() {
+        val permissionsToRequest = mutableListOf<String>()
+        if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.S) {
+            if (!checkBluetoothScanPermission()) permissionsToRequest.add(Manifest.permission.BLUETOOTH_SCAN)
+            if (!checkBluetoothConnectPermission()) permissionsToRequest.add(Manifest.permission.BLUETOOTH_CONNECT)
+        }
+        if (ContextCompat.checkSelfPermission(this, Manifest.permission.ACCESS_FINE_LOCATION) != PackageManager.PERMISSION_GRANTED) permissionsToRequest.add(Manifest.permission.ACCESS_FINE_LOCATION)
+
+        if (permissionsToRequest.isNotEmpty()) {
+            requestPermissionLauncher.launch(permissionsToRequest.toTypedArray())
         } else {
-            Toast.makeText(this, "Device not found for connection.", Toast.LENGTH_SHORT).show()
+            if (bluetoothAdapter?.isEnabled == true) {
+                startScanningBLE()
+            } else {
+                promptEnableBluetooth()
+            }
         }
     }
 
-    @SuppressLint("MissingPermission")
-    override fun onDestroy() {
-        super.onDestroy()
-        try {
-            unregisterReceiver(bluetoothDiscoveryReceiver)
-        } catch (e: IllegalArgumentException) {
-            // Receiver not registered, or already unregistered. Safe to ignore.
-            Log.w("DeviceListActivity", "Bluetooth discovery receiver not registered or already unregistered: ${e.message}")
-        }
-        bluetoothAdapter?.cancelDiscovery() // Ensure discovery is stopped
-        bluetoothClassicManager.stop() // Clean up any ongoing connections/listeners
+    private fun startScanningBLE() {
+        // Stop other scans
+        stopScanning() // Calls stopScanning for Classic BT
+        WifiDirectManager.disconnect() // Stop any active Wi-Fi Direct connection/discovery
+
+        deviceAdapter.clearDevices()
+        binding.tvStatusMessage.text = "Scanning for BLE devices..."
+        binding.tvStatusMessage.visibility = View.VISIBLE
+        binding.progressBarScanning.visibility = View.VISIBLE
+
+        BLEManager.startScan()
     }
 
-    // Helper extension function for string capitalization
+    // --- New: Wi-Fi Direct Permissions & Scan ---
+    private fun checkWifiDirectPermissions(): Boolean {
+        val permissions = mutableListOf<String>()
+        permissions.add(Manifest.permission.ACCESS_FINE_LOCATION)
+        permissions.add(Manifest.permission.ACCESS_WIFI_STATE)
+        permissions.add(Manifest.permission.CHANGE_WIFI_STATE)
+        if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.TIRAMISU) {
+            permissions.add(Manifest.permission.NEARBY_WIFI_DEVICES)
+        }
+        return permissions.all { ContextCompat.checkSelfPermission(this, it) == PackageManager.PERMISSION_GRANTED }
+    }
+
+    private fun requestWifiDirectPermissionsAndScan() {
+        val permissionsToRequest = mutableListOf<String>()
+        if (ContextCompat.checkSelfPermission(this, Manifest.permission.ACCESS_FINE_LOCATION) != PackageManager.PERMISSION_GRANTED) permissionsToRequest.add(Manifest.permission.ACCESS_FINE_LOCATION)
+        if (ContextCompat.checkSelfPermission(this, Manifest.permission.ACCESS_WIFI_STATE) != PackageManager.PERMISSION_GRANTED) permissionsToRequest.add(Manifest.permission.ACCESS_WIFI_STATE)
+        if (ContextCompat.checkSelfPermission(this, Manifest.permission.CHANGE_WIFI_STATE) != PackageManager.PERMISSION_GRANTED) permissionsToRequest.add(Manifest.permission.CHANGE_WIFI_STATE)
+        if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.TIRAMISU) {
+            if (ContextCompat.checkSelfPermission(this, Manifest.permission.NEARBY_WIFI_DEVICES) != PackageManager.PERMISSION_GRANTED) permissionsToRequest.add(Manifest.permission.NEARBY_WIFI_DEVICES)
+        }
+
+        if (permissionsToRequest.isNotEmpty()) {
+            requestPermissionLauncher.launch(permissionsToRequest.toTypedArray())
+        } else {
+            // Check if Wi-Fi is enabled
+            if (wifiManager?.isWifiEnabled == true) {
+                startScanningWifiDirect()
+            } else {
+                promptEnableWifi()
+            }
+        }
+    }
+
+    private fun startScanningWifiDirect() {
+        // Stop other scans
+        stopScanning() // Stop Classic BT discovery
+        BLEManager.stopScan() // Stop BLE scan
+
+        deviceAdapter.clearDevices()
+        binding.tvStatusMessage.text = "Scanning for Wi-Fi Direct peers..."
+        binding.tvStatusMessage.visibility = View.VISIBLE
+        binding.progressBarScanning.visibility = View.VISIBLE
+
+        WifiDirectManager.discoverPeers()
+    }
+
+    private fun promptEnableWifi() {
+        val enableWifiIntent = Intent(Settings.ACTION_WIFI_SETTINGS)
+        requestWifiEnableLauncher.launch(enableWifiIntent)
+    }
+
     private fun String.capitalizeWords(): String =
         split(" ").joinToString(" ") { it.replaceFirstChar { char -> if (char.isLowerCase()) char.titlecase() else char.toString() } }
 }

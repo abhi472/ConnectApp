@@ -2,46 +2,75 @@
 <manifest xmlns:android="http://schemas.android.com/apk/res/android"
     xmlns:tools="http://schemas.android.com/tools">
 
+    <!-- Permissions required for Bluetooth Classic and BLE -->
     <uses-permission android:name="android.permission.BLUETOOTH" />
     <uses-permission android:name="android.permission.BLUETOOTH_ADMIN" />
+    <!-- Required for Bluetooth operations on Android 12 (API 31) and above -->
     <uses-permission android:name="android.permission.BLUETOOTH_CONNECT" />
     <uses-permission android:name="android.permission.BLUETOOTH_SCAN" />
     <uses-permission android:name="android.permission.BLUETOOTH_ADVERTISE" />
+
+    <!-- Location permissions required for Bluetooth scanning (both Classic and BLE) and Wi-Fi Direct peer discovery -->
     <uses-permission android:name="android.permission.ACCESS_FINE_LOCATION" />
     <uses-permission android:name="android.permission.ACCESS_COARSE_LOCATION" />
+
+    <!-- Permissions required for Wi-Fi Direct -->
     <uses-permission android:name="android.permission.ACCESS_WIFI_STATE" />
     <uses-permission android:name="android.permission.CHANGE_WIFI_STATE" />
     <uses-permission android:name="android.permission.INTERNET" />
+    <!-- Required for Wi-Fi Direct peer discovery on Android 13 (API 33) and above -->
     <uses-permission android:name="android.permission.NEARBY_WIFI_DEVICES" />
+
+    <!-- Storage permissions for future image gallery features -->
     <uses-permission android:name="android.permission.READ_MEDIA_IMAGES" />
-    <uses-permission android:name="android.permission.READ_EXTERNAL_STORAGE"
-        android:maxSdkVersion="32" />
+    <uses-permission android:name="android.permission.READ_EXTERNAL_STORAGE" android:maxSdkVersion="32" />
+
+    <!-- Foreground Service permissions for persistent Bluetooth connections (if used) -->
     <uses-permission android:name="android.permission.FOREGROUND_SERVICE" />
     <uses-permission android:name="android.permission.FOREGROUND_SERVICE_BLUETOOTH" />
+
+    <!-- Feature declarations -->
+    <uses-feature android:name="android.hardware.bluetooth" android:required="false" />
+    <uses-feature android:name="android.hardware.bluetooth_le" android:required="false" />
+    <uses-feature android:name="android.hardware.wifi.direct" android:required="false" />
+
 
     <application
         android:allowBackup="true"
         android:dataExtractionRules="@xml/data_extraction_rules"
-        android:fullBackupContent="@xml/full_backup_content"
+        android:fullBackupContent="@xml/backup_rules"
         android:icon="@mipmap/ic_launcher"
         android:label="@string/app_name"
         android:roundIcon="@mipmap/ic_launcher_round"
         android:supportsRtl="true"
         android:theme="@style/Theme.ConnectApp"
         tools:targetApi="31">
-        <activity
-            android:name=".PageCActivity"
-            android:exported="false" />
+
         <activity
             android:name=".MainActivity"
             android:exported="true">
             <intent-filter>
                 <action android:name="android.intent.action.MAIN" />
-
                 <category android:name="android.intent.category.LAUNCHER" />
             </intent-filter>
         </activity>
         <activity android:name=".DeviceListActivity" />
-    </application>
+        <activity android:name=".PageCActivity" />
+        <!-- Removed ImageGalleryActivity as per user request -->
+        <!-- <activity android:name=".ImageGalleryActivity" /> -->
 
+        <!-- Wi-Fi Direct Broadcast Receiver declaration -->
+        <!-- REMOVED: This receiver is registered programmatically in DeviceListActivity -->
+        <!-- <receiver
+            android:name=".connectivity.WiFiDirectBroadcastReceiver"
+            android:exported="true">
+            <intent-filter>
+                <action android:name="android.net.wifi.p2p.STATE_CHANGED" />
+                <action android:name="android.net.wifi.p2p.PEERS_CHANGED" />
+                <action android:name="android.net.wifi.p2p.CONNECTION_STATE_CHANGED" />
+                <action android:name="android.net.wifi.p2p.THIS_DEVICE_CHANGED" />
+            </intent-filter>
+        </receiver> -->
+
+    </application>
 </manifest>

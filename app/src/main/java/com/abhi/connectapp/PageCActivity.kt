@@ -1,98 +1,143 @@
 package com.abhi.connectapp
 
 
-import android.bluetooth.BluetoothDevice
-import android.content.Intent
 import android.os.Bundle
 import android.text.method.ScrollingMovementMethod
-import android.util.Log
+import android.view.View
 import android.widget.Toast
 import androidx.appcompat.app.AppCompatActivity
+import com.abhi.connectapp.connectivity.BLEManager
 import com.abhi.connectapp.connectivity.BluetoothClassicManager
+import com.abhi.connectapp.connectivity.ConnectionState
+import com.abhi.connectapp.connectivity.WifiDirectManager // Import Wi-Fi Direct Manager
 import com.abhi.connectapp.databinding.ActivityPageCBinding
+import com.abhi.connectapp.utils.Constants
+
 
 class PageCActivity : AppCompatActivity() {
 
     private lateinit var binding: ActivityPageCBinding
     private var connectedDeviceName: String? = null
-    private var connectedDeviceAddress: String? = null
+    private var connectionType: String? = null
 
     override fun onCreate(savedInstanceState: Bundle?) {
         super.onCreate(savedInstanceState)
         binding = ActivityPageCBinding.inflate(layoutInflater)
         setContentView(binding.root)
 
-        // Retrieve connected device info from intent
         connectedDeviceName = intent.getStringExtra("device_name")
-        connectedDeviceAddress = intent.getStringExtra("device_address") // Though not directly used, useful for debugging
+        connectionType = intent.getStringExtra("connection_type")
 
-        binding.tvConnectedDeviceInfo.text = "Connected to: ${connectedDeviceName ?: "Unknown Device"}"
-        binding.tvMessagesDisplay.movementMethod = ScrollingMovementMethod() // Enable scrolling for messages
+        binding.tvConnectedDeviceInfo.text = "Connected to: ${connectedDeviceName ?: "Unknown Device"} via ${connectionType?.replace("_", " ")?.capitalizeWords()}"
+        binding.tvMessagesDisplay.movementMethod = ScrollingMovementMethod()
 
         setupSendMessageButton()
-        observeBluetoothManager()
-
-        // Optional: Start listening for connections if this device is meant to be the server/receiver initially
-        // This part needs careful thought based on your app's flow.
-        // If this activity is always launched after a client connection, you don't need to listen here.
-        // If this activity could also be reached by a device waiting for connection, you'd start server here.
-        // For now, assuming client has connected to a server on another device.
+        observeManagers() // New method to observe both managers
     }
 
     private fun setupSendMessageButton() {
         binding.btnSendMessage.setOnClickListener {
             val message = binding.etMessageInput.text.toString().trim()
             if (message.isNotEmpty()) {
-                BluetoothClassicManager.writeData(message)
-                appendMessage("[You]: $message\n")
-                binding.etMessageInput.text.clear() // Clear input field
+                val sent = when (connectionType) {
+                    Constants.CONNECTION_TYPE_BLUETOOTH_CLASSIC -> {
+                        BluetoothClassicManager.writeData(message)
+                        true
+                    }
+                    Constants.CONNECTION_TYPE_BLE -> {
+                        BLEManager.writeCharacteristic(message)
+                    }
+                    Constants.CONNECTION_TYPE_WIFI_DIRECT -> {
+                        // For Wi-Fi Direct, we'll implement socket communication here later.
+                        // For now, it will just log and return false indicating not yet sent.
+                        WifiDirectManager.sendData(message) // Placeholder call
+                        true // Assume true for now, actual socket logic will determine success
+                    }
+                    else -> false
+                }
+
+                if (sent) {
+                    appendMessage("[You]: $message\n")
+                    binding.etMessageInput.text.clear()
+                } else {
+                    Toast.makeText(this, "Failed to send message. Check connection.", Toast.LENGTH_SHORT).show()
+                }
             } else {
                 Toast.makeText(this, "Message cannot be empty", Toast.LENGTH_SHORT).show()
             }
         }
     }
 
-    private fun observeBluetoothManager() {
-        // Observe incoming data
-        BluetoothClassicManager.receivedData.observe(this) { data ->
-            appendMessage("[Remote]: $data\n")
-        }
-
-        // Observe connection state changes
-        BluetoothClassicManager.connectionState.observe(this) { (state, message) ->
-            when (state) {
-                ConnectionState.DISCONNECTED -> {
-                    Toast.makeText(this, "Disconnected: ${message ?: ""}", Toast.LENGTH_LONG).show()
-                    // Optionally disable UI elements or navigate back
-                    finish() // Go back to device list or main screen
+    private fun observeManagers() {
+        // Observe incoming data based on connection type
+        when (connectionType) {
+            Constants.CONNECTION_TYPE_BLUETOOTH_CLASSIC -> {
+                BluetoothClassicManager.receivedData.observe(this) { data ->
+                    appendMessage("[Remote]: $data\n")
                 }
-                ConnectionState.FAILED -> {
-                    Toast.makeText(this, "Connection Error: ${message ?: "Unknown error"}", Toast.LENGTH_LONG).show()
-                    // Optionally disable UI elements or navigate back
-                    finish()
+                BluetoothClassicManager.connectionState.observe(this) { (state, message) ->
+                    handleConnectionStateChange(state, message)
                 }
-                // CONNECTING and CONNECTED states are primarily handled by DeviceListActivity
-                else -> { /* Do nothing for other states here */ }
+            }
+            Constants.CONNECTION_TYPE_BLE -> {
+                BLEManager.bleReceivedData.observe(this) { data ->
+                    appendMessage("[Remote]: $data\n")
+                }
+                BLEManager.bleConnectionState.observe(this) { (state, message) ->
+                    handleConnectionStateChange(state, message)
+                }
+            }
+            Constants.CONNECTION_TYPE_WIFI_DIRECT -> {
+                WifiDirectManager.receivedData.observe(this) { data ->
+                    appendMessage("[Remote]: $data\n")
+                }
+                // Observe Wi-Fi Direct connection state
+                WifiDirectManager.connectionState.observe(this) { (state, message) ->
+                    handleConnectionStateChange(state, message)
+                }
             }
         }
     }
 
+    private fun handleConnectionStateChange(state: ConnectionState, message: String?) {
+        when (state) {
+            ConnectionState.DISCONNECTED -> {
+                Toast.makeText(this, "Disconnected: ${message ?: ""}", Toast.LENGTH_LONG).show()
+                binding.etMessageInput.isEnabled = false
+                binding.btnSendMessage.isEnabled = false
+                finish()
+            }
+            ConnectionState.FAILED -> {
+                Toast.makeText(this, "Connection Error: ${message ?: "Unknown error"}", Toast.LENGTH_LONG).show()
+                binding.etMessageInput.isEnabled = false
+                binding.btnSendMessage.isEnabled = false
+                finish()
+            }
+            else -> { /* Do nothing for CONNECTING and CONNECTED states here, as they initiate this activity */ }
+        }
+    }
+
+
     private fun appendMessage(message: String) {
-        // Append message to TextView and scroll to bottom
         binding.tvMessagesDisplay.append(message)
         binding.svMessages.post {
-            binding.svMessages.fullScroll(android.view.View.FOCUS_DOWN)
+            binding.svMessages.fullScroll(View.FOCUS_DOWN)
         }
     }
 
     override fun onDestroy() {
         super.onDestroy()
-        // No explicit unregistering for LiveData is needed as it's lifecycle-aware,
-        // but ensure manager is properly stopped if this activity is the "end" of the communication flow.
-        // For a multi-activity app, you might want to keep the connection alive if navigating away.
-        // For a full app, consider where to call BluetoothClassicManager.stop() to clean up.
-        // For now, if we finish() this activity, the connection persists until explicitly stopped.
-        // If we want to ensure disconnect on leaving PageC, you'd add:
-        // BluetoothClassicManager.stop()
+        // Determine whether to stop the manager based on your app's logic.
+        // If connection should persist, do not call stop() here.
+        // For this example, let's assume PageC is the main communication endpoint,
+        // so we'll stop the manager if the activity is destroyed.
+        when(connectionType) {
+            Constants.CONNECTION_TYPE_BLUETOOTH_CLASSIC -> BluetoothClassicManager.stop()
+            Constants.CONNECTION_TYPE_BLE -> BLEManager.disconnect() // Disconnects GATT, but manager can be reused
+            Constants.CONNECTION_TYPE_WIFI_DIRECT -> WifiDirectManager.disconnect() // Disconnect Wi-Fi Direct group
+        }
     }
+
+    private fun String.capitalizeWords(): String =
+        split(" ").joinToString(" ") { it.replaceFirstChar { char -> if (char.isLowerCase()) char.titlecase() else char.toString() } }
 }

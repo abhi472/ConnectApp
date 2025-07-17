@@ -1,8 +1,7 @@
 package com.abhi.connectapp.connectivity
 
-import android.annotation.SuppressLint
-
 import android.Manifest
+import android.annotation.SuppressLint
 import android.bluetooth.BluetoothAdapter
 import android.bluetooth.BluetoothDevice
 import android.bluetooth.BluetoothServerSocket
@@ -80,11 +79,24 @@ object BluetoothClassicManager { // Changed to object for singleton pattern
     }
 
     /**
+     * Checks if the BLUETOOTH_SCAN permission is granted.
+     * @return true if permission is granted, false otherwise.
+     */
+    private fun hasBluetoothScanPermission(): Boolean {
+        return appContext?.let {
+            ContextCompat.checkSelfPermission(it, Manifest.permission.BLUETOOTH_SCAN) == PackageManager.PERMISSION_GRANTED
+        } ?: run {
+            Log.e(TAG, "Application context is null. Cannot check BLUETOOTH_SCAN permission.")
+            false
+        }
+    }
+
+    /**
      * Safely retrieves the device name, checking for BLUETOOTH_CONNECT permission.
      * @param device The BluetoothDevice.
      * @return The device name or a fallback string if permission is denied.
      */
-    @SuppressLint("MissingPermission")
+    @SuppressLint("MissingPermission") // Permission checked by hasBluetoothConnectPermission()
     private fun getDeviceName(device: BluetoothDevice): String {
         return if (hasBluetoothConnectPermission()) {
             device.name ?: "Unknown Device"
@@ -99,11 +111,8 @@ object BluetoothClassicManager { // Changed to object for singleton pattern
      * @return The device address or a fallback string if permission is denied.
      */
     private fun getDeviceAddress(device: BluetoothDevice): String {
-        return if (hasBluetoothConnectPermission()) {
-            device.address
-        } else {
-            "XX:XX:XX:XX:XX:XX (Permission Denied)"
-        }
+        // Device address does not require BLUETOOTH_CONNECT permission
+        return device.address
     }
 
     /**
@@ -196,13 +205,12 @@ object BluetoothClassicManager { // Changed to object for singleton pattern
     /**
      * Thread for handling client-side connection attempts to a remote device.
      */
-    private class ConnectThread(private val device: BluetoothDevice) : Thread() {
+    private class ConnectThread(private val device: BluetoothDevice) : Thread() { // Removed 'inner'
         private val mmSocket: BluetoothSocket? by lazy(LazyThreadSafetyMode.NONE) {
             try {
-                if (!hasBluetoothConnectPermission()) {
+                if (!BluetoothClassicManager.hasBluetoothConnectPermission()) { // Access permission check via singleton
                     Log.e(TAG, "BLUETOOTH_CONNECT permission not granted for createRfcommSocketToServiceRecord.")
-                    // Post failure via LiveData. This will be caught by the observer.
-                    _connectionState.postValue(Pair(ConnectionState.FAILED, "Permission missing for socket creation."))
+                    BluetoothClassicManager._connectionState.postValue(Pair(ConnectionState.FAILED, "Permission missing for socket creation."))
                     return@lazy null
                 }
                 device.createRfcommSocketToServiceRecord(MY_UUID)
@@ -212,15 +220,16 @@ object BluetoothClassicManager { // Changed to object for singleton pattern
             }
         }
 
+        @SuppressLint("MissingPermission") // Permissions checked before calls
         override fun run() {
-            val deviceName = getDeviceName(device)
+            val deviceName = BluetoothClassicManager.getDeviceName(device) // Access via singleton
             Log.i(TAG, "BEGIN ConnectThread to $deviceName")
 
             // Always cancel discovery because it will slow down a connection
-            bluetoothAdapter?.let { adapter ->
-                appContext?.let { ctx ->
+            BluetoothClassicManager.bluetoothAdapter?.let { adapter -> // Access via singleton
+                BluetoothClassicManager.appContext?.let { ctx -> // Access via singleton
                     if (adapter.isDiscovering) {
-                        if (ContextCompat.checkSelfPermission(ctx, Manifest.permission.BLUETOOTH_SCAN) == PackageManager.PERMISSION_GRANTED) {
+                        if (BluetoothClassicManager.hasBluetoothScanPermission()) { // Check permission here
                             adapter.cancelDiscovery()
                         } else {
                             Log.e(TAG, "BLUETOOTH_SCAN permission not granted for cancelDiscovery in ConnectThread.")
@@ -234,9 +243,9 @@ object BluetoothClassicManager { // Changed to object for singleton pattern
                 // Connect to the remote device through the socket. This call blocks
                 // until it succeeds or throws an exception.
                 try {
-                    if (!hasBluetoothConnectPermission()) {
+                    if (!BluetoothClassicManager.hasBluetoothConnectPermission()) { // Access permission check via singleton
                         Log.e(TAG, "BLUETOOTH_CONNECT permission not granted for socket.connect().")
-                        _connectionState.postValue(Pair(ConnectionState.FAILED, "Permission missing for socket connection."))
+                        BluetoothClassicManager._connectionState.postValue(Pair(ConnectionState.FAILED, "Permission missing for socket connection."))
                         return
                     }
                     socket.connect()
@@ -249,15 +258,15 @@ object BluetoothClassicManager { // Changed to object for singleton pattern
                     } catch (e2: IOException) {
                         Log.e(TAG, "Could not close client socket after failed connection", e2)
                     }
-                    _connectionState.postValue(Pair(ConnectionState.FAILED, e.message ?: "Connection failed"))
+                    BluetoothClassicManager._connectionState.postValue(Pair(ConnectionState.FAILED, e.message ?: "Connection failed"))
                     return
                 }
 
                 // The connection attempt succeeded. Perform work in a separate thread.
-                connected(socket, device)
+                BluetoothClassicManager.connected(socket, device) // Access via singleton
             } ?: run {
                 Log.e(TAG, "ConnectThread: Socket is null, connection failed.")
-                _connectionState.postValue(Pair(ConnectionState.FAILED, "Socket creation failed."))
+                BluetoothClassicManager._connectionState.postValue(Pair(ConnectionState.FAILED, "Socket creation failed."))
             }
         }
 
@@ -278,22 +287,23 @@ object BluetoothClassicManager { // Changed to object for singleton pattern
      * Thread for handling server-side incoming connections.
      * Listens for a connection, accepts it, and then hands it over to ConnectedThread.
      */
-    @SuppressLint("MissingPermission")
-    private class AcceptThread : Thread() {
+    @SuppressLint("MissingPermission") // Permission checked by hasBluetoothConnectPermission()
+    private class AcceptThread : Thread() { // Removed 'inner'
         private val mmServerSocket: BluetoothServerSocket? by lazy(LazyThreadSafetyMode.NONE) {
             try {
-                if (!hasBluetoothConnectPermission()) {
+                if (!BluetoothClassicManager.hasBluetoothConnectPermission()) { // Access permission check via singleton
                     Log.e(TAG, "BLUETOOTH_CONNECT permission not granted for listenUsingRfcommWithServiceRecord.")
-                    _connectionState.postValue(Pair(ConnectionState.FAILED, "Permission missing for server socket creation."))
+                    BluetoothClassicManager._connectionState.postValue(Pair(ConnectionState.FAILED, "Permission missing for server socket creation."))
                     return@lazy null
                 }
-                bluetoothAdapter?.listenUsingRfcommWithServiceRecord(MY_APP_NAME, MY_UUID)
+                BluetoothClassicManager.bluetoothAdapter?.listenUsingRfcommWithServiceRecord(MY_APP_NAME, MY_UUID) // Access via singleton
             } catch (e: IOException) {
                 Log.e(TAG, "Socket's listen() method failed", e)
                 null
             }
         }
 
+        @SuppressLint("MissingPermission") // Permission checked by hasBluetoothConnectPermission() before starting thread
         override fun run() {
             Log.i(TAG, "BEGIN AcceptThread")
             var socket: BluetoothSocket? = null
@@ -304,15 +314,15 @@ object BluetoothClassicManager { // Changed to object for singleton pattern
                     socket = mmServerSocket?.accept() // This is a blocking call
                 } catch (e: IOException) {
                     Log.e(TAG, "Socket's accept() method failed", e)
-                    _connectionState.postValue(Pair(ConnectionState.FAILED, e.message ?: "Server listening failed"))
+                    BluetoothClassicManager._connectionState.postValue(Pair(ConnectionState.FAILED, e.message ?: "Server listening failed"))
                     break // Exit loop on exception
                 }
 
                 socket?.let {
                     val remoteDevice = it.remoteDevice
-                    Log.d(TAG, "AcceptThread: Connection accepted from ${getDeviceName(remoteDevice)}")
+                    Log.d(TAG, "AcceptThread: Connection accepted from ${BluetoothClassicManager.getDeviceName(remoteDevice)}") // Access via singleton
                     // A connection was accepted. Perform work in a separate thread.
-                    connected(it, remoteDevice)
+                    BluetoothClassicManager.connected(it, remoteDevice) // Access via singleton
                     // Close the server socket once a connection is established (for single connections)
                     try {
                         mmServerSocket?.close()
@@ -342,14 +352,15 @@ object BluetoothClassicManager { // Changed to object for singleton pattern
      * Thread for handling data transfer after a connection is established.
      * Manages input and output streams.
      */
-    class ConnectedThread(val mmSocket: BluetoothSocket) : Thread() {
+    class ConnectedThread(internal val mmSocket: BluetoothSocket) : Thread() { // Removed 'inner', mmSocket is internal
         private val mmInStream: InputStream = mmSocket.inputStream
         private val mmOutStream: OutputStream = mmSocket.outputStream
         private val buffer: ByteArray = ByteArray(1024) // mmBuffer store for the stream
 
+        @SuppressLint("MissingPermission") // Permission checked by hasBluetoothConnectPermission() on calling methods
         override fun run() {
             Log.i(TAG, "BEGIN ConnectedThread")
-            val remoteDeviceName = getDeviceName(mmSocket.remoteDevice)
+            val remoteDeviceName = BluetoothClassicManager.getDeviceName(mmSocket.remoteDevice) // Access via singleton
 
             var numBytes: Int // bytes returned from read()
 
@@ -361,12 +372,12 @@ object BluetoothClassicManager { // Changed to object for singleton pattern
                     // Get the message as a string
                     val receivedMessage = String(buffer, 0, numBytes)
                     Log.d(TAG, "Data received: $receivedMessage")
-                    _receivedData.postValue(receivedMessage) // Post to LiveData for UI observers
+                    BluetoothClassicManager._receivedData.postValue(receivedMessage) // Post to LiveData for UI observers
 
                 } catch (e: IOException) {
                     Log.e(TAG, "Input stream was disconnected or error occurred", e)
                     // Notify about connection loss
-                    _connectionState.postValue(Pair(ConnectionState.DISCONNECTED, "Connection lost: ${e.message}"))
+                    BluetoothClassicManager._connectionState.postValue(Pair(ConnectionState.DISCONNECTED, "Connection lost: ${e.message}"))
                     try { mmSocket.close() } catch (e: IOException) { /* ignore */ }
                     break // Exit the loop
                 }
@@ -378,14 +389,14 @@ object BluetoothClassicManager { // Changed to object for singleton pattern
          * @param bytes The bytes to send.
          */
         fun write(bytes: ByteArray) {
-            val remoteDeviceName = getDeviceName(mmSocket.remoteDevice)
+            val remoteDeviceName = BluetoothClassicManager.getDeviceName(mmSocket.remoteDevice) // Access via singleton
             try {
                 mmOutStream.write(bytes)
                 Log.d(TAG, "Data sent: ${String(bytes)}")
                 // Optionally, add a callback for data sent successfully if needed
             } catch (e: IOException) {
                 Log.e(TAG, "Error writing to output stream", e)
-                _connectionState.postValue(Pair(ConnectionState.FAILED, "Error sending data to $remoteDeviceName: ${e.message}"))
+                BluetoothClassicManager._connectionState.postValue(Pair(ConnectionState.FAILED, "Error sending data to $remoteDeviceName: ${e.message}"))
             }
         }
 
@@ -417,6 +428,7 @@ object BluetoothClassicManager { // Changed to object for singleton pattern
     /**
      * Returns the currently connected BluetoothDevice, if any.
      */
+    @SuppressLint("MissingPermission") // Permission checked by hasBluetoothConnectPermission() on calling methods
     fun getConnectedDevice(): BluetoothDevice? = connectedThread?.mmSocket?.remoteDevice
 
     /**
