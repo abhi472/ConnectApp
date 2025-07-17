@@ -129,4 +129,25 @@ If you accidentally deny any permissions, the app will prompt you with a dialog 
 * **Restart Devices:** Sometimes, a device restart can resolve underlying Bluetooth or Wi-Fi stack issues.
 * **UUIDs:** For Bluetooth Classic and BLE, ensure the UUIDs used in `Constants.kt` and `BLEManager.kt` match between the two devices if you're testing with a custom service.
 
+
+## 6. Screenshots
+
+Here are some screenshots illustrating the application's UI and connectivity states:
+
+* **BLE Device Discovery and Connection
+Screenshot: /screenshot/7.jpg
+
+Screenshot: /screenshot/5.jpg 
+
+Screenshot: /screenshot/2.jpg
+
+
+* **BLE Device Discovery and Connection
+Screenshot: /screenshot/9.jpg
+
+Screenshot: /screenshot/1.jpg
+
+Screenshot: /screenshot/4.jpg
+
+
 This documentation should provide a solid guide for thoroughly testing your application's connectivity features.
