@@ -8,7 +8,13 @@ import android.bluetooth.BluetoothGatt
 import android.bluetooth.BluetoothGattCallback
 import android.bluetooth.BluetoothGattCharacteristic
 import android.bluetooth.BluetoothGattDescriptor
+import android.bluetooth.BluetoothGattServer
+import android.bluetooth.BluetoothGattServerCallback
+import android.bluetooth.BluetoothGattService
 import android.bluetooth.BluetoothProfile
+import android.bluetooth.le.AdvertiseCallback
+import android.bluetooth.le.AdvertiseData
+import android.bluetooth.le.AdvertiseSettings
 import android.bluetooth.le.ScanCallback
 import android.bluetooth.le.ScanFilter
 import android.bluetooth.le.ScanResult
@@ -18,6 +24,7 @@ import android.content.pm.PackageManager
 import android.os.Build
 import android.os.Handler
 import android.os.Looper
+import android.os.ParcelUuid
 import android.util.Log
 import androidx.core.content.ContextCompat
 import androidx.lifecycle.LiveData
@@ -35,33 +42,45 @@ object BLEManager {
 
     private var appContext: Context? = null
     private var bluetoothAdapter: BluetoothAdapter? = null
+    private var bluetoothManager: android.bluetooth.BluetoothManager? = null // Added BluetoothManager
     private val bluetoothLeScanner by lazy { bluetoothAdapter?.bluetoothLeScanner }
+    private val bluetoothLeAdvertiser by lazy { bluetoothAdapter?.bluetoothLeAdvertiser }
 
+    // BLE Client (Scanner & Gatt Client) related
     private var scanning = false
     private val scanResults = mutableMapOf<String, BluetoothDevice>()
+    private var bluetoothGattClient: BluetoothGatt? = null // Renamed to clarify client role
+    private var clientWriteCharacteristic: BluetoothGattCharacteristic? = null // Renamed
+    private var clientNotifyCharacteristic: BluetoothGattCharacteristic? = null // Renamed
 
-    private var bluetoothGatt: BluetoothGatt? = null
-    private var writeCharacteristic: BluetoothGattCharacteristic? = null
-    private var notifyCharacteristic: BluetoothGattCharacteristic? = null
+    // BLE Server (Gatt Server & Advertiser) related
+    private var bluetoothGattServer: BluetoothGattServer? = null
+    private var serverWriteCharacteristic: BluetoothGattCharacteristic? = null
+    private var serverNotifyCharacteristic: BluetoothGattCharacteristic? = null
+    private val registeredDevices = mutableSetOf<BluetoothDevice>() // Devices that enabled notifications
+    private var advertising = false
 
     // LiveData for BLE Scan Results
     private val _bleScanResults = MutableLiveData<List<BluetoothDevice>>()
     val bleScanResults: LiveData<List<BluetoothDevice>> = _bleScanResults
 
-    // LiveData for BLE Connection State
-    private val _bleConnectionState = MutableLiveData<Pair<ConnectionState, String?>>()
-    val bleConnectionState: LiveData<Pair<ConnectionState, String?>> = _bleConnectionState
+    // LiveData for BLE Client Connection State (when this device connects to another server)
+    private val _bleClientConnectionState = MutableLiveData<Pair<ConnectionState, String?>>()
+    val bleClientConnectionState: LiveData<Pair<ConnectionState, String?>> = _bleClientConnectionState
 
-    // LiveData for received BLE Data (assuming we'll use a notify characteristic)
+    // LiveData for BLE Server Connection State (when other devices connect to this server)
+    private val _bleServerConnectionState = MutableLiveData<Pair<ConnectionState, String?>>()
+    val bleServerConnectionState: LiveData<Pair<ConnectionState, String?>> = _bleServerConnectionState
+
+    // LiveData for received BLE Data (from client or server)
     private val _bleReceivedData = MutableLiveData<String>()
     val bleReceivedData: LiveData<String> = _bleReceivedData
 
-    // Callback for BLE Scan
+    // Callback for BLE Scan (Client role)
     private val bleScanCallback = object : ScanCallback() {
         @SuppressLint("MissingPermission") // Permission checked by hasBluetoothConnectPermission()
         override fun onScanResult(callbackType: Int, result: ScanResult) {
             val device = result.device
-            // Check BLUETOOTH_CONNECT permission before accessing device.name
             val deviceName = if (hasBluetoothConnectPermission()) device.name else "N/A"
             Log.d(TAG, "BLE Device found: ${deviceName} (${device.address})")
             if (device.address != null && !scanResults.containsKey(device.address)) {
@@ -71,59 +90,52 @@ object BLEManager {
         }
 
         override fun onBatchScanResults(results: List<ScanResult>) {
-            // Iterate through batch results and process each one
             for (result in results) {
-                // When processing batch results, you typically just pass the ScanResult itself
-                // to your processing logic. The 'callbackType' from the original onScanResult
-                // is not relevant here as these are batched.
-                onScanResult(ScanSettings.CALLBACK_TYPE_ALL_MATCHES, result) // Use a valid callback type from ScanSettings
+                onScanResult(ScanSettings.CALLBACK_TYPE_ALL_MATCHES, result)
             }
         }
 
         override fun onScanFailed(errorCode: Int) {
             Log.e(TAG, "BLE Scan Failed: $errorCode")
             scanning = false
-            _bleScanResults.postValue(emptyList()) // Clear results on failure
-            _bleConnectionState.postValue(Pair(ConnectionState.FAILED, "BLE scan failed: $errorCode"))
+            _bleScanResults.postValue(emptyList())
+            _bleClientConnectionState.postValue(Pair(ConnectionState.FAILED, "BLE scan failed: $errorCode"))
         }
     }
 
-    // Callback for BLE GATT operations
-    private val bleGattCallback = object : BluetoothGattCallback() {
+    // Callback for BLE GATT Client operations (when this device connects to another server)
+    private val bleGattClientCallback = object : BluetoothGattCallback() {
         @SuppressLint("MissingPermission") // Permissions checked by hasBluetoothConnectPermission()
         override fun onConnectionStateChange(gatt: BluetoothGatt, status: Int, newState: Int) {
-            // Check BLUETOOTH_CONNECT permission before accessing gatt.device.name
             val deviceName = if (hasBluetoothConnectPermission()) gatt.device.name else "N/A"
             val deviceAddress = gatt.device.address
             if (status == BluetoothGatt.GATT_SUCCESS) {
                 if (newState == BluetoothProfile.STATE_CONNECTED) {
                     Log.i(TAG, "Connected to GATT client: $deviceName ($deviceAddress)")
-                    _bleConnectionState.postValue(Pair(ConnectionState.CONNECTED, deviceName))
-                    // Discover services after successful connection
+                    _bleClientConnectionState.postValue(Pair(ConnectionState.CONNECTED, deviceName))
                     if (hasBluetoothConnectPermission()) {
                         gatt.discoverServices()
                     } else {
                         Log.e(TAG, "BLUETOOTH_CONNECT permission not granted for discoverServices.")
-                        _bleConnectionState.postValue(Pair(ConnectionState.FAILED, "Permission missing for service discovery."))
-                        // Close GATT if permissions are missing to prevent hanging
-                        gatt.close() // Close even if permission check fails, to clean up
+                        _bleClientConnectionState.postValue(Pair(ConnectionState.FAILED, "Permission missing for client service discovery."))
+                        gatt.close()
                     }
 
                 } else if (newState == BluetoothProfile.STATE_DISCONNECTED) {
                     Log.i(TAG, "Disconnected from GATT client: $deviceName ($deviceAddress)")
-                    _bleConnectionState.postValue(Pair(ConnectionState.DISCONNECTED, deviceName))
-                    gatt.close() // Close even if permission check fails, to clean up
-                    bluetoothGatt = null
-                    writeCharacteristic = null
-                    notifyCharacteristic = null
+                    _bleClientConnectionState.postValue(Pair(ConnectionState.DISCONNECTED, deviceName))
+                    gatt.close()
+                    bluetoothGattClient = null
+                    clientWriteCharacteristic = null
+                    clientNotifyCharacteristic = null
                 }
             } else {
-                Log.w(TAG, "Connection state change error: $status for $deviceName ($deviceAddress)")
-                _bleConnectionState.postValue(Pair(ConnectionState.FAILED, "Connection error: $deviceName (Status: $status)"))
-                gatt.close() // Close even if permission check fails, to clean up
-                bluetoothGatt = null
-                writeCharacteristic = null
-                notifyCharacteristic = null
+                Log.w(TAG, "Client Connection state change error: $status for $deviceName ($deviceAddress)")
+                _bleClientConnectionState.postValue(Pair(ConnectionState.FAILED, "Client connection error: $deviceName (Status: $status)"))
+                gatt.close()
+                bluetoothGattClient = null
+                clientWriteCharacteristic = null
+                clientNotifyCharacteristic = null
             }
         }
 
@@ -132,50 +144,46 @@ object BLEManager {
             if (status == BluetoothGatt.GATT_SUCCESS) {
                 val service = gatt.getService(SERVICE_UUID)
                 if (service != null) {
-                    writeCharacteristic = service.getCharacteristic(CHARACTERISTIC_WRITE_UUID)
-                    notifyCharacteristic = service.getCharacteristic(CHARACTERISTIC_NOTIFY_UUID)
+                    clientWriteCharacteristic = service.getCharacteristic(CHARACTERISTIC_WRITE_UUID)
+                    clientNotifyCharacteristic = service.getCharacteristic(CHARACTERISTIC_NOTIFY_UUID)
 
-                    if (writeCharacteristic != null) {
-                        Log.d(TAG, "Write characteristic found: ${writeCharacteristic!!.uuid}")
+                    if (clientWriteCharacteristic != null) {
+                        Log.d(TAG, "Client Write characteristic found: ${clientWriteCharacteristic!!.uuid}")
                     } else {
-                        Log.e(TAG, "Write characteristic not found for service ${SERVICE_UUID}")
+                        Log.e(TAG, "Client Write characteristic not found for service ${SERVICE_UUID}")
                     }
 
-                    if (notifyCharacteristic != null) {
-                        Log.d(TAG, "Notify characteristic found: ${notifyCharacteristic!!.uuid}")
-                        // Enable notifications for this characteristic
+                    if (clientNotifyCharacteristic != null) {
+                        Log.d(TAG, "Client Notify characteristic found: ${clientNotifyCharacteristic!!.uuid}")
                         if (hasBluetoothConnectPermission()) {
-                            gatt.setCharacteristicNotification(notifyCharacteristic, true)
-                            val descriptor = notifyCharacteristic?.getDescriptor(CLIENT_CHARACTERISTIC_CONFIG_UUID)
+                            gatt.setCharacteristicNotification(clientNotifyCharacteristic, true)
+                            val descriptor = clientNotifyCharacteristic?.getDescriptor(CLIENT_CHARACTERISTIC_CONFIG_UUID)
                             descriptor?.let {
                                 it.value = BluetoothGattDescriptor.ENABLE_NOTIFICATION_VALUE
                                 gatt.writeDescriptor(it)
                             }
                         } else {
-                            Log.e(TAG, "BLUETOOTH_CONNECT permission not granted for notifications.")
-                            _bleConnectionState.postValue(Pair(ConnectionState.FAILED, "Permission missing for notifications."))
+                            Log.e(TAG, "BLUETOOTH_CONNECT permission not granted for client notifications.")
                         }
                     } else {
-                        Log.e(TAG, "Notify characteristic not found for service ${SERVICE_UUID}")
+                        Log.e(TAG, "Client Notify characteristic not found for service ${SERVICE_UUID}")
                     }
                 } else {
-                    Log.e(TAG, "Service not found: ${SERVICE_UUID}")
-                    _bleConnectionState.postValue(Pair(ConnectionState.FAILED, "Service not found on device."))
+                    Log.e(TAG, "Client Service not found: ${SERVICE_UUID}")
+                    _bleClientConnectionState.postValue(Pair(ConnectionState.FAILED, "Client Service not found on device."))
                 }
             } else {
-                Log.w(TAG, "onServicesDiscovered received: $status")
-                _bleConnectionState.postValue(Pair(ConnectionState.FAILED, "Service discovery failed: $status"))
+                Log.w(TAG, "Client onServicesDiscovered received: $status")
+                _bleClientConnectionState.postValue(Pair(ConnectionState.FAILED, "Client Service discovery failed: $status"))
             }
         }
 
         @SuppressLint("MissingPermission") // Permissions checked by hasBluetoothConnectPermission()
         override fun onCharacteristicWrite(gatt: BluetoothGatt, characteristic: BluetoothGattCharacteristic, status: Int) {
             if (status == BluetoothGatt.GATT_SUCCESS) {
-                Log.d(TAG, "Characteristic ${characteristic.uuid} written successfully.")
-                // Optionally update UI that data was sent
+                Log.d(TAG, "Client Characteristic ${characteristic.uuid} written successfully.")
             } else {
-                Log.w(TAG, "Characteristic write failed: ${status} for ${characteristic.uuid}")
-                // Inform UI about write failure
+                Log.w(TAG, "Client Characteristic write failed: ${status} for ${characteristic.uuid}")
             }
         }
 
@@ -185,20 +193,115 @@ object BLEManager {
             if (status == BluetoothGatt.GATT_SUCCESS) {
                 val data = characteristic.value
                 val message = String(data, Charsets.UTF_8)
-                Log.d(TAG, "Characteristic ${characteristic.uuid} read: $message")
-                _bleReceivedData.postValue(message) // Post to LiveData
+                Log.d(TAG, "Client Characteristic ${characteristic.uuid} read: $message")
+                _bleReceivedData.postValue(message)
             } else {
-                Log.w(TAG, "Characteristic read failed: ${status} for ${characteristic.uuid}")
+                Log.w(TAG, "Client Characteristic read failed: ${status} for ${characteristic.uuid}")
             }
         }
 
         @Suppress("DEPRECATION") // For older Android versions compatibility
         override fun onCharacteristicChanged(gatt: BluetoothGatt, characteristic: BluetoothGattCharacteristic) {
-            if (characteristic.uuid == CHARACTERISTIC_NOTIFY_UUID) { // Corrected reference
+            if (characteristic.uuid == CHARACTERISTIC_NOTIFY_UUID) {
                 val data = characteristic.value
                 val message = String(data, Charsets.UTF_8)
-                Log.d(TAG, "Characteristic ${characteristic.uuid} notified: $message")
-                _bleReceivedData.postValue(message) // Post to LiveData
+                Log.d(TAG, "Client Characteristic ${characteristic.uuid} notified: $message")
+                _bleReceivedData.postValue(message)
+            }
+        }
+    }
+
+    // Callback for BLE Advertising (Server role)
+    private val advertiseCallback = object : AdvertiseCallback() {
+        override fun onStartSuccess(settingsInEffect: AdvertiseSettings?) {
+            super.onStartSuccess(settingsInEffect)
+            advertising = true
+            Log.d(TAG, "BLE Advertising started successfully.")
+            _bleServerConnectionState.postValue(Pair(ConnectionState.CONNECTING, "Advertising..."))
+        }
+
+        override fun onStartFailure(errorCode: Int) {
+            super.onStartFailure(errorCode)
+            advertising = false
+            val errorMessage = "BLE Advertising failed: $errorCode"
+            Log.e(TAG, errorMessage)
+            _bleServerConnectionState.postValue(Pair(ConnectionState.FAILED, errorMessage))
+        }
+    }
+
+    // Callback for BLE GATT Server operations (when other devices connect to this server)
+    private val bleGattServerCallback = object : BluetoothGattServerCallback() {
+        @SuppressLint("MissingPermission") // Permissions checked by hasBluetoothConnectPermission()
+        override fun onConnectionStateChange(device: BluetoothDevice, status: Int, newState: Int) {
+            val deviceName = if (hasBluetoothConnectPermission()) device.name else "N/A"
+            if (status == BluetoothGatt.GATT_SUCCESS) {
+                if (newState == BluetoothProfile.STATE_CONNECTED) {
+                    Log.i(TAG, "Server: Device connected: $deviceName (${device.address})")
+                    _bleServerConnectionState.postValue(Pair(ConnectionState.CONNECTED, deviceName))
+                    // Add device to list of registered devices if it's not already there
+                    registeredDevices.add(device)
+                } else if (newState == BluetoothProfile.STATE_DISCONNECTED) {
+                    Log.i(TAG, "Server: Device disconnected: $deviceName (${device.address})")
+                    _bleServerConnectionState.postValue(Pair(ConnectionState.DISCONNECTED, deviceName))
+                    registeredDevices.remove(device)
+                }
+            } else {
+                Log.w(TAG, "Server: Connection state change error: $status for $deviceName (${device.address})")
+                _bleServerConnectionState.postValue(Pair(ConnectionState.FAILED, "Server connection error: $deviceName (Status: $status)"))
+                registeredDevices.remove(device)
+            }
+        }
+
+        @SuppressLint("MissingPermission") // Permissions checked by hasBluetoothConnectPermission()
+        override fun onCharacteristicWriteRequest(device: BluetoothDevice, requestId: Int, characteristic: BluetoothGattCharacteristic, preparedWrite: Boolean, responseNeeded: Boolean, offset: Int, value: ByteArray?) {
+            super.onCharacteristicWriteRequest(device, requestId, characteristic, preparedWrite, responseNeeded, offset, value)
+            if (characteristic.uuid == CHARACTERISTIC_WRITE_UUID) {
+                val receivedMessage = value?.let { String(it, Charsets.UTF_8) } ?: ""
+                Log.d(TAG, "Server: Received write request from ${device.name}: $receivedMessage")
+                _bleReceivedData.postValue(receivedMessage)
+
+                if (responseNeeded) {
+                    bluetoothGattServer?.sendResponse(device, requestId, BluetoothGatt.GATT_SUCCESS, offset, value)
+                }
+            } else {
+                Log.w(TAG, "Server: Unknown characteristic write request: ${characteristic.uuid}")
+                if (responseNeeded) {
+                    bluetoothGattServer?.sendResponse(device, requestId, BluetoothGatt.GATT_FAILURE, offset, null)
+                }
+            }
+        }
+
+        @SuppressLint("MissingPermission") // Permissions checked by hasBluetoothConnectPermission()
+        override fun onDescriptorWriteRequest(device: BluetoothDevice, requestId: Int, descriptor: BluetoothGattDescriptor, preparedWrite: Boolean, responseNeeded: Boolean, offset: Int, value: ByteArray?) {
+            super.onDescriptorWriteRequest(device, requestId, descriptor, preparedWrite, responseNeeded, offset, value)
+            if (descriptor.uuid == CLIENT_CHARACTERISTIC_CONFIG_UUID) {
+                if (value != null && value.contentEquals(BluetoothGattDescriptor.ENABLE_NOTIFICATION_VALUE)) {
+                    Log.d(TAG, "Server: Client ${device.name} enabled notifications.")
+                    // Add device to list of devices that want notifications
+                    registeredDevices.add(device)
+                } else if (value != null && value.contentEquals(BluetoothGattDescriptor.DISABLE_NOTIFICATION_VALUE)) {
+                    Log.d(TAG, "Server: Client ${device.name} disabled notifications.")
+                    // Remove device from list of devices that want notifications
+                    registeredDevices.remove(device)
+                }
+                if (responseNeeded) {
+                    bluetoothGattServer?.sendResponse(device, requestId, BluetoothGatt.GATT_SUCCESS, offset, value)
+                }
+            } else {
+                Log.w(TAG, "Server: Unknown descriptor write request: ${descriptor.uuid}")
+                if (responseNeeded) {
+                    bluetoothGattServer?.sendResponse(device, requestId, BluetoothGatt.GATT_FAILURE, offset, null)
+                }
+            }
+        }
+
+        @SuppressLint("MissingPermission")
+        override fun onNotificationSent(device: BluetoothDevice, status: Int) {
+            super.onNotificationSent(device, status)
+            if (status == BluetoothGatt.GATT_SUCCESS) {
+                Log.d(TAG, "Server: Notification sent successfully to ${device.name}.")
+            } else {
+                Log.w(TAG, "Server: Failed to send notification to ${device.name}, status: $status")
             }
         }
     }
@@ -210,10 +313,12 @@ object BLEManager {
         if (appContext == null) {
             appContext = context.applicationContext
             bluetoothAdapter = adapter
+            bluetoothManager = appContext?.getSystemService(Context.BLUETOOTH_SERVICE) as? android.bluetooth.BluetoothManager // Initialize BluetoothManager
             Log.d(TAG, "BLEManager initialized.")
         }
     }
 
+    // --- Permission Check Helpers ---
     private fun hasBluetoothScanPermission(): Boolean {
         return appContext?.let {
             ContextCompat.checkSelfPermission(it, Manifest.permission.BLUETOOTH_SCAN) == PackageManager.PERMISSION_GRANTED
@@ -226,16 +331,29 @@ object BLEManager {
         } ?: false
     }
 
+    fun hasBluetoothAdvertisePermission(): Boolean {
+        return appContext?.let {
+            // BLUETOOTH_ADVERTISE is only for Android 12 (API 31) and above
+            if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.S) {
+                ContextCompat.checkSelfPermission(it, Manifest.permission.BLUETOOTH_ADVERTISE) == PackageManager.PERMISSION_GRANTED
+            } else {
+                true // Not required on older versions
+            }
+        } ?: false
+    }
+
     private fun hasFineLocationPermission(): Boolean {
         return appContext?.let {
             ContextCompat.checkSelfPermission(it, Manifest.permission.ACCESS_FINE_LOCATION) == PackageManager.PERMISSION_GRANTED
         } ?: false
     }
 
+    // --- BLE Client (Scanner & Gatt Client) Methods ---
+
     /**
      * Starts BLE scanning for devices.
      */
-    @SuppressLint("MissingPermission") // Permission checked by hasBluetoothScanPermission()
+    @SuppressLint("MissingPermission") // Permissions checked by hasBluetoothScanPermission()
     fun startScan() {
         if (bluetoothAdapter == null || bluetoothLeScanner == null) {
             Log.e(TAG, "BluetoothAdapter or Scanner not initialized.")
@@ -243,20 +361,25 @@ object BLEManager {
             return
         }
 
+        if (!bluetoothAdapter!!.isEnabled) {
+            _bleClientConnectionState.postValue(Pair(ConnectionState.FAILED, "Bluetooth is off. Enable Bluetooth to scan."))
+            return
+        }
+
         // Check for necessary permissions
         if (!hasBluetoothScanPermission() || !hasFineLocationPermission()) {
             Log.e(TAG, "Missing BLUETOOTH_SCAN or ACCESS_FINE_LOCATION permission for BLE scan.")
-            _bleScanResults.postValue(emptyList()) // Clear previous results
-            _bleConnectionState.postValue(Pair(ConnectionState.FAILED, "Missing scan permissions."))
+            _bleScanResults.postValue(emptyList())
+            _bleClientConnectionState.postValue(Pair(ConnectionState.FAILED, "Missing scan permissions."))
             return
         }
 
         if (!scanning) {
             scanResults.clear()
-            _bleScanResults.postValue(emptyList()) // Clear existing list for new scan
+            _bleScanResults.postValue(emptyList())
 
             val scanFilter = ScanFilter.Builder()
-                //.setServiceUuid(ParcelUuid(SERVICE_UUID)) // Optional: Filter by service UUID
+                .setServiceUuid(ParcelUuid(SERVICE_UUID)) // Filter by our custom service UUID
                 .build()
 
             val scanSettings = ScanSettings.Builder()
@@ -266,8 +389,7 @@ object BLEManager {
             Log.d(TAG, "Starting BLE scan...")
             bluetoothLeScanner?.startScan(listOf(scanFilter), scanSettings, bleScanCallback)
             scanning = true
-            _bleConnectionState.postValue(Pair(ConnectionState.CONNECTING, "Scanning for BLE devices...")) // Use CONNECTING for scanning status
-            // Stop scan after a delay (e.g., 10 seconds)
+            _bleClientConnectionState.postValue(Pair(ConnectionState.CONNECTING, "Scanning for BLE devices..."))
             Handler(Looper.getMainLooper()).postDelayed({
                 stopScan()
             }, 10000) // Scan for 10 seconds
@@ -280,11 +402,11 @@ object BLEManager {
     @SuppressLint("MissingPermission") // Permission checked by hasBluetoothScanPermission()
     fun stopScan() {
         if (scanning) {
-            if (bluetoothLeScanner != null) { // Permission checked by hasBluetoothScanPermission()
+            if (bluetoothLeScanner != null) {
                 bluetoothLeScanner?.stopScan(bleScanCallback)
                 scanning = false
                 Log.d(TAG, "BLE scan stopped.")
-                _bleConnectionState.postValue(Pair(ConnectionState.DISCONNECTED, "Scan finished.")) // Use DISCONNECTED after scan
+                _bleClientConnectionState.postValue(Pair(ConnectionState.DISCONNECTED, "Scan finished."))
             } else {
                 Log.e(TAG, "Cannot stop scan: Scanner null or BLUETOOTH_SCAN permission missing.")
             }
@@ -293,109 +415,248 @@ object BLEManager {
 
     /**
      * Connects to a selected BLE device (GATT server).
-     * @param device The BluetoothDevice to connect to.
      */
     @SuppressLint("MissingPermission") // Permission checked by hasBluetoothConnectPermission()
     fun connect(device: BluetoothDevice) {
         if (!hasBluetoothConnectPermission()) {
-            _bleConnectionState.postValue(Pair(ConnectionState.FAILED, "BLUETOOTH_CONNECT permission not granted for connection."))
+            _bleClientConnectionState.postValue(Pair(ConnectionState.FAILED, "BLUETOOTH_CONNECT permission not granted for connection."))
             return
         }
         if (bluetoothAdapter == null || appContext == null) {
-            _bleConnectionState.postValue(Pair(ConnectionState.FAILED, "BLE Manager not initialized."))
+            _bleClientConnectionState.postValue(Pair(ConnectionState.FAILED, "BLE Manager not initialized."))
             return
         }
 
         stopScan() // Stop scanning when connecting
 
         Log.d(TAG, "Attempting to connect to BLE device: ${device.name} (${device.address})")
-        _bleConnectionState.postValue(Pair(ConnectionState.CONNECTING, device.name ?: device.address))
+        _bleClientConnectionState.postValue(Pair(ConnectionState.CONNECTING, device.name ?: device.address))
 
-        // Connect to GATT server
-        // autoConnect=false means direct connection, faster for known devices but consumes more power
-        bluetoothGatt = if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.M) {
-            device.connectGatt(appContext, false, bleGattCallback, BluetoothDevice.TRANSPORT_LE)
+        bluetoothGattClient = if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.M) {
+            device.connectGatt(appContext, false, bleGattClientCallback, BluetoothDevice.TRANSPORT_LE)
         } else {
             @Suppress("DEPRECATION")
-            device.connectGatt(appContext, false, bleGattCallback)
+            device.connectGatt(appContext, false, bleGattClientCallback)
         }
     }
 
     /**
-     * Disconnects from the currently connected GATT server.
+     * Disconnects from the currently connected GATT server (client role).
      */
     @SuppressLint("MissingPermission") // Permission checked by hasBluetoothConnectPermission()
-    fun disconnect() {
-        if (bluetoothGatt != null) { // Permission checked by hasBluetoothConnectPermission()
-            Log.d(TAG, "Disconnecting from GATT server.")
-            bluetoothGatt?.disconnect()
-            // State change will be handled by onConnectionStateChange callback
+    fun disconnectClient() {
+        if (bluetoothGattClient != null) {
+            Log.d(TAG, "Disconnecting from GATT server (client role).")
+            bluetoothGattClient?.disconnect()
         } else {
-            Log.w(TAG, "Cannot disconnect: BluetoothGatt is null or BLUETOOTH_CONNECT permission missing.")
-            _bleConnectionState.postValue(Pair(ConnectionState.DISCONNECTED, "Already disconnected or permission missing."))
+            Log.w(TAG, "Cannot disconnect client: BluetoothGattClient is null or permission missing.")
+            _bleClientConnectionState.postValue(Pair(ConnectionState.DISCONNECTED, "Already disconnected or permission missing."))
         }
     }
 
     /**
-     * Writes data to a BLE characteristic.
+     * Writes data to a BLE characteristic on the connected GATT server (client role).
      * @param data The string data to write.
      * @return True if write was initiated, false otherwise.
      */
     @SuppressLint("MissingPermission") // Permission checked by hasBluetoothConnectPermission()
     fun writeCharacteristic(data: String): Boolean {
-        if (bluetoothGatt == null || writeCharacteristic == null) {
-            Log.e(TAG, "BluetoothGatt or write characteristic not ready.")
-            _bleConnectionState.postValue(Pair(ConnectionState.FAILED, "Cannot send data: Not connected or characteristic missing."))
+        if (bluetoothGattClient == null || clientWriteCharacteristic == null) {
+            Log.e(TAG, "BluetoothGattClient or client write characteristic not ready.")
+            _bleClientConnectionState.postValue(Pair(ConnectionState.FAILED, "Cannot send data: Not connected or characteristic missing."))
             return false
         }
 
         if (!hasBluetoothConnectPermission()) {
             Log.e(TAG, "BLUETOOTH_CONNECT permission not granted for writing characteristic.")
-            _bleConnectionState.postValue(Pair(ConnectionState.FAILED, "Permission missing for data transfer."))
+            _bleClientConnectionState.postValue(Pair(ConnectionState.FAILED, "Permission missing for data transfer."))
             return false
         }
 
         val bytes = data.toByteArray(Charsets.UTF_8)
-        writeCharacteristic?.value = bytes
+        clientWriteCharacteristic?.value = bytes
 
-        return bluetoothGatt?.writeCharacteristic(writeCharacteristic) ?: false
+        return bluetoothGattClient?.writeCharacteristic(clientWriteCharacteristic) ?: false
+    }
+
+    // --- BLE Server (Gatt Server & Advertiser) Methods ---
+
+    /**
+     * Initializes the GATT Server and adds the custom service.
+     * Call this once when the app starts or when you want to enable server capabilities.
+     */
+    @SuppressLint("MissingPermission") // Permissions checked internally
+    fun startGattServer() {
+        if (bluetoothAdapter == null || appContext == null || bluetoothManager == null) { // Added bluetoothManager check
+            Log.e(TAG, "BluetoothAdapter, AppContext, or BluetoothManager not initialized for GATT Server.")
+            _bleServerConnectionState.postValue(Pair(ConnectionState.FAILED, "Server init failed: Manager not initialized."))
+            return
+        }
+
+        if (!bluetoothAdapter!!.isEnabled) {
+            _bleServerConnectionState.postValue(Pair(ConnectionState.FAILED, "Bluetooth is off. Enable Bluetooth to start server."))
+            return
+        }
+
+        if (!hasBluetoothConnectPermission()) {
+            Log.e(TAG, "BLUETOOTH_CONNECT permission not granted for GATT Server.")
+            _bleServerConnectionState.postValue(Pair(ConnectionState.FAILED, "Server init failed: BLUETOOTH_CONNECT permission missing."))
+            return
+        }
+
+        if (bluetoothGattServer != null) {
+            Log.d(TAG, "GATT Server already running.")
+            return
+        }
+
+        bluetoothGattServer = bluetoothManager?.openGattServer(appContext, bleGattServerCallback) // Corrected call
+        bluetoothGattServer?.let { gattServer ->
+            val service = BluetoothGattService(SERVICE_UUID, BluetoothGattService.SERVICE_TYPE_PRIMARY)
+
+            // Add Write Characteristic
+            serverWriteCharacteristic = BluetoothGattCharacteristic(
+                CHARACTERISTIC_WRITE_UUID,
+                BluetoothGattCharacteristic.PROPERTY_WRITE or BluetoothGattCharacteristic.PROPERTY_WRITE_NO_RESPONSE,
+                BluetoothGattCharacteristic.PERMISSION_WRITE
+            )
+            service.addCharacteristic(serverWriteCharacteristic)
+
+            // Add Notify Characteristic
+            serverNotifyCharacteristic = BluetoothGattCharacteristic(
+                CHARACTERISTIC_NOTIFY_UUID,
+                BluetoothGattCharacteristic.PROPERTY_NOTIFY,
+                BluetoothGattCharacteristic.PERMISSION_READ
+            ).apply {
+                addDescriptor(
+                    BluetoothGattDescriptor(
+                        CLIENT_CHARACTERISTIC_CONFIG_UUID,
+                        BluetoothGattDescriptor.PERMISSION_WRITE or BluetoothGattDescriptor.PERMISSION_READ
+                    )
+                )
+            }
+            service.addCharacteristic(serverNotifyCharacteristic)
+
+            gattServer.addService(service)
+            Log.d(TAG, "GATT Server initialized and service added.")
+            _bleServerConnectionState.postValue(Pair(ConnectionState.DISCONNECTED, "GATT Server Ready.")) // Ready to advertise/accept
+        } ?: run {
+            Log.e(TAG, "Failed to open GATT Server.")
+            _bleServerConnectionState.postValue(Pair(ConnectionState.FAILED, "Failed to open GATT Server."))
+        }
     }
 
     /**
-     * Reads data from a BLE characteristic.
-     * Note: This is usually for static reads. For continuous data, use notifications.
-     * @return True if read was initiated, false otherwise.
+     * Starts advertising the BLE GATT Service.
+     * Requires BLUETOOTH_ADVERTISE permission (Android 12+).
      */
-    @SuppressLint("MissingPermission") // Permission checked by hasBluetoothConnectPermission()
-    fun readCharacteristic(characteristic: BluetoothGattCharacteristic): Boolean {
-        if (bluetoothGatt == null || characteristic == null) {
-            Log.e(TAG, "BluetoothGatt or characteristic not ready.")
+    @SuppressLint("MissingPermission") // Permissions checked internally
+    fun startAdvertising() {
+        if (bluetoothLeAdvertiser == null) {
+            Log.e(TAG, "BluetoothLEAdvertiser not initialized.")
+            _bleServerConnectionState.postValue(Pair(ConnectionState.FAILED, "Advertising failed: Advertiser not ready."))
+            return
+        }
+        if (!hasBluetoothAdvertisePermission()) {
+            Log.e(TAG, "BLUETOOTH_ADVERTISE permission not granted.")
+            _bleServerConnectionState.postValue(Pair(ConnectionState.FAILED, "Advertising failed: BLUETOOTH_ADVERTISE permission missing."))
+            return
+        }
+        if (advertising) {
+            Log.d(TAG, "Already advertising.")
+            return
+        }
+
+        val settings = AdvertiseSettings.Builder()
+            .setAdvertiseMode(AdvertiseSettings.ADVERTISE_MODE_LOW_LATENCY)
+            .setTxPowerLevel(AdvertiseSettings.ADVERTISE_TX_POWER_HIGH)
+            .setConnectable(true)
+            .build()
+
+        val data = AdvertiseData.Builder()
+            .setIncludeDeviceName(true)
+            .addServiceUuid(ParcelUuid(SERVICE_UUID))
+            .build()
+
+        bluetoothLeAdvertiser?.startAdvertising(settings, data, advertiseCallback)
+    }
+
+    /**
+     * Stops BLE GATT Service advertising.
+     */
+    @SuppressLint("MissingPermission") // Permissions checked internally
+    fun stopAdvertising() {
+        if (bluetoothLeAdvertiser != null && advertising) {
+            bluetoothLeAdvertiser?.stopAdvertising(advertiseCallback)
+            advertising = false
+            Log.d(TAG, "BLE Advertising stopped.")
+            _bleServerConnectionState.postValue(Pair(ConnectionState.DISCONNECTED, "Advertising stopped."))
+        } else {
+            Log.w(TAG, "Cannot stop advertising: Advertiser null or not advertising.")
+        }
+    }
+
+    /**
+     * Sends a notification to all subscribed BLE clients (Server role).
+     * @param data The string data to send.
+     * @return True if notification was initiated for at least one device, false otherwise.
+     */
+    @SuppressLint("MissingPermission") // Permissions checked by hasBluetoothConnectPermission()
+    fun sendNotification(data: String): Boolean { // Added Boolean return type
+        if (serverNotifyCharacteristic == null) {
+            Log.e(TAG, "Server notify characteristic not ready.")
+            _bleServerConnectionState.postValue(Pair(ConnectionState.FAILED, "Cannot send notification: Characteristic missing."))
             return false
         }
         if (!hasBluetoothConnectPermission()) {
-            Log.e(TAG, "BLUETOOTH_CONNECT permission not granted for reading characteristic.")
+            Log.e(TAG, "BLUETOOTH_CONNECT permission not granted for sending notification.")
+            _bleServerConnectionState.postValue(Pair(ConnectionState.FAILED, "Permission missing for notification."))
             return false
         }
-        return bluetoothGatt?.readCharacteristic(characteristic) ?: false
+
+        serverNotifyCharacteristic?.value = data.toByteArray(Charsets.UTF_8)
+
+        var notificationInitiated = false
+        // Iterate through all registered devices and send notification
+        if (bluetoothGattServer != null) {
+            for (device in registeredDevices) {
+                Log.d(TAG, "Server: Sending notification to ${device.name ?: device.address}")
+                // notifyCharacteristicChanged returns true if the notification was successfully queued
+                if (bluetoothGattServer?.notifyCharacteristicChanged(device, serverNotifyCharacteristic, false) == true) {
+                    notificationInitiated = true
+                }
+            }
+        } else {
+            Log.e(TAG, "GATT Server is null, cannot send notification.")
+            _bleServerConnectionState.postValue(Pair(ConnectionState.FAILED, "GATT Server not active, cannot send notification."))
+            return false
+        }
+        return notificationInitiated
     }
 
     /**
-     * Cleans up BLE resources.
+     * Cleans up all BLE resources (Client and Server).
      */
-    @SuppressLint("MissingPermission") // Permission checked by hasBluetoothConnectPermission()
+    @SuppressLint("MissingPermission") // Permissions checked internally
     fun close() {
+        // Stop Client operations
         stopScan()
-        disconnect() // Disconnects if connected
-        if (bluetoothGatt != null) { // Permission checked by hasBluetoothConnectPermission()
-            bluetoothGatt?.close()
-        } else {
-            Log.w(TAG, "BLUETOOTH_CONNECT permission missing, cannot explicitly close BluetoothGatt.")
-        }
-        bluetoothGatt = null
-        writeCharacteristic = null
-        notifyCharacteristic = null
+        disconnectClient()
+        bluetoothGattClient?.close()
+        bluetoothGattClient = null
+        clientWriteCharacteristic = null
+        clientNotifyCharacteristic = null
+
+        // Stop Server operations
+        stopAdvertising()
+        bluetoothGattServer?.close()
+        bluetoothGattServer = null
+        serverWriteCharacteristic = null
+        serverNotifyCharacteristic = null
+        registeredDevices.clear()
+
         appContext = null
         bluetoothAdapter = null
+        bluetoothManager = null // Clear BluetoothManager reference
         Log.d(TAG, "BLEManager closed.")
     }
 }

@@ -50,8 +50,6 @@ class DeviceListActivity : AppCompatActivity() {
 
     // Wi-Fi Direct specific
     private var wifiManager: WifiManager? = null
-    // No longer need to declare wifiP2pManager and wifiP2pChannel here,
-    // as we access them via WifiDirectManager.wifiP2pManager and WifiDirectManager.channel
     private lateinit var wifiDirectReceiver: WiFiDirectBroadcastReceiver
     private val wifiDirectIntentFilter = IntentFilter()
 
@@ -95,7 +93,8 @@ class DeviceListActivity : AppCompatActivity() {
                 }
                 Constants.CONNECTION_TYPE_BLE -> {
                     if (checkBLEPermissions()) {
-                        startScanningBLE()
+                        // After enabling BT, decide whether to scan as client or advertise as server
+                        startScanningBLE() // This will now also start advertising
                     }
                 }
             }
@@ -213,8 +212,9 @@ class DeviceListActivity : AppCompatActivity() {
         if (checkBluetoothScanPermission()) {
             bluetoothAdapter?.cancelDiscovery()
         }
-        BLEManager.stopScan() // Ensure BLE scan is stopped
-        BLEManager.close() // Close BLE resources
+        BLEManager.stopScan() // Ensure BLE client scan is stopped
+        BLEManager.stopAdvertising() // Ensure BLE server advertising is stopped
+        BLEManager.close() // Close all BLE resources (client and server)
         BluetoothClassicManager.stop() // Stop Classic BT resources
         WifiDirectManager.close() // Close Wi-Fi Direct resources
     }
@@ -234,6 +234,8 @@ class DeviceListActivity : AppCompatActivity() {
                 Constants.CONNECTION_TYPE_BLE -> {
                     val remoteDevice = if (checkBluetoothConnectPermission()) bluetoothAdapter?.getRemoteDevice(device.address) else null
                     if (remoteDevice != null) {
+                        // When connecting as BLE Client, stop advertising if currently acting as server
+                        BLEManager.stopAdvertising()
                         BLEManager.connect(remoteDevice)
                     } else {
                         Toast.makeText(this, "Could not get remote device for BLE or permission missing.", Toast.LENGTH_SHORT).show()
@@ -276,7 +278,7 @@ class DeviceListActivity : AppCompatActivity() {
                     }
                     Constants.CONNECTION_TYPE_BLE -> {
                         if (bluetoothAdapter?.isEnabled == true) {
-                            startScanningBLE()
+                            startScanningBLE() // This will now also start advertising
                         } else {
                             promptEnableBluetooth()
                         }
@@ -318,7 +320,7 @@ class DeviceListActivity : AppCompatActivity() {
             deviceAdapter.clearDevices()
             when (connectionType) {
                 Constants.CONNECTION_TYPE_BLUETOOTH_CLASSIC -> requestBluetoothClassicPermissionsAndScan()
-                Constants.CONNECTION_TYPE_BLE -> requestBLEPermissionsAndScan()
+                Constants.CONNECTION_TYPE_BLE -> requestBLEPermissionsAndScan() // This will now also start advertising
                 Constants.CONNECTION_TYPE_WIFI_DIRECT -> requestWifiDirectPermissionsAndScan()
             }
         }
@@ -335,7 +337,7 @@ class DeviceListActivity : AppCompatActivity() {
         // Initialize both Bluetooth managers
         bluetoothAdapter?.let { adapter ->
             BluetoothClassicManager.init(applicationContext, adapter)
-            BLEManager.init(applicationContext, adapter)
+            BLEManager.init(applicationContext, adapter) // Pass BluetoothAdapter to BLEManager
         }
     }
 
@@ -363,9 +365,18 @@ class DeviceListActivity : AppCompatActivity() {
                 updateUIForConnectionState(state, message)
             }
         }
-        BLEManager.bleConnectionState.observe(this) { (state, message) ->
+        // Observe BLE Client Connection State
+        BLEManager.bleClientConnectionState.observe(this) { (state, message) ->
             if (connectionType == Constants.CONNECTION_TYPE_BLE) {
-                updateUIForConnectionState(state, message)
+                // This device is acting as a client
+                updateUIForConnectionState(state, message, "BLE Client")
+            }
+        }
+        // Observe BLE Server Connection State
+        BLEManager.bleServerConnectionState.observe(this) { (state, message) ->
+            if (connectionType == Constants.CONNECTION_TYPE_BLE) {
+                // This device is acting as a server
+                updateUIForConnectionState(state, message, "BLE Server")
             }
         }
         WifiDirectManager.connectionState.observe(this) { (state, message) ->
@@ -375,17 +386,19 @@ class DeviceListActivity : AppCompatActivity() {
         }
     }
 
-    private fun updateUIForConnectionState(state: ConnectionState, message: String?) {
+    // Overloaded function to include connection role for BLE
+    private fun updateUIForConnectionState(state: ConnectionState, message: String?, role: String? = null) {
+        val roleSuffix = if (role != null) " ($role)" else ""
         when (state) {
             ConnectionState.CONNECTING -> {
-                Toast.makeText(this, "Attempting to connect to $message...", Toast.LENGTH_SHORT).show()
-                binding.tvStatusMessage.text = "Connecting to $message..."
+                Toast.makeText(this, "Attempting to connect to $message$roleSuffix...", Toast.LENGTH_SHORT).show()
+                binding.tvStatusMessage.text = "Connecting to $message$roleSuffix..."
                 binding.tvStatusMessage.visibility = View.VISIBLE
                 binding.progressBarScanning.visibility = View.VISIBLE
             }
             ConnectionState.CONNECTED -> {
-                Toast.makeText(this, "Connected to $message", Toast.LENGTH_SHORT).show()
-                binding.tvStatusMessage.text = "Connected to $message"
+                Toast.makeText(this, "Connected to $message$roleSuffix", Toast.LENGTH_SHORT).show()
+                binding.tvStatusMessage.text = "Connected to $message$roleSuffix"
                 binding.progressBarScanning.visibility = View.GONE
 
                 // For Wi-Fi Direct, explicitly request connection info to get GO IP
@@ -394,17 +407,17 @@ class DeviceListActivity : AppCompatActivity() {
                     WifiDirectManager.requestConnectionInfo()
                 } else {
                     // Navigate for Bluetooth Classic and BLE
-                    navigateToPageC(message)
+                    navigateToPageC(message, connectionType, role)
                 }
             }
             ConnectionState.FAILED -> {
-                Toast.makeText(this, "Connection failed: ${message ?: "Unknown error"}", Toast.LENGTH_LONG).show()
-                binding.tvStatusMessage.text = "Connection failed: ${message ?: "Unknown error"}"
+                Toast.makeText(this, "Connection failed: ${message ?: "Unknown error"}$roleSuffix", Toast.LENGTH_LONG).show()
+                binding.tvStatusMessage.text = "Connection failed: ${message ?: "Unknown error"}$roleSuffix"
                 binding.progressBarScanning.visibility = View.GONE
             }
             ConnectionState.DISCONNECTED -> {
-                Toast.makeText(this, "Disconnected: ${message ?: ""}", Toast.LENGTH_SHORT).show()
-                binding.tvStatusMessage.text = "Disconnected."
+                Toast.makeText(this, "Disconnected: ${message ?: ""}$roleSuffix", Toast.LENGTH_SHORT).show()
+                binding.tvStatusMessage.text = "Disconnected.$roleSuffix"
                 binding.progressBarScanning.visibility = View.GONE
                 // Clear devices on disconnect for all types
                 deviceAdapter.clearDevices()
@@ -412,14 +425,16 @@ class DeviceListActivity : AppCompatActivity() {
         }
     }
 
-    // New: Handle navigation to PageC once connection info is available for Wi-Fi Direct
-    private fun navigateToPageC(deviceName: String?) {
+    // Modified to pass connectionType and role
+    private fun navigateToPageC(deviceName: String?, connectionType: String?, role: String? = null) {
         val intent = Intent(this@DeviceListActivity, PageCActivity::class.java).apply {
             putExtra("device_name", deviceName)
             putExtra("connection_type", connectionType)
+            putExtra("ble_role", role) // Pass the BLE role
         }
         startActivity(intent)
-        finish()
+        // Removed finish() here to keep DeviceListActivity in the back stack
+        // This prevents immediate onDestroy and cleanup of BLEManager resources
     }
 
 
@@ -483,7 +498,7 @@ class DeviceListActivity : AppCompatActivity() {
                     // Both devices will receive this callback.
                     // Now, you can proceed to set up your TCP/IP sockets for data transfer.
                     // For now, we navigate to PageC, passing the GO's address as the "device name"
-                    navigateToPageC(info.groupOwnerAddress.hostAddress)
+                    navigateToPageC(info.groupOwnerAddress.hostAddress, Constants.CONNECTION_TYPE_WIFI_DIRECT)
                 } else {
                     // This state might occur if group formation fails after connection attempt
                     Toast.makeText(this, "Wi-Fi Direct group not formed.", Toast.LENGTH_LONG).show()
@@ -540,6 +555,7 @@ class DeviceListActivity : AppCompatActivity() {
     private fun startScanningBluetoothClassic() {
         // Stop other scans
         BLEManager.stopScan()
+        BLEManager.stopAdvertising() // Stop advertising if active
         WifiDirectManager.disconnect() // Stop any active Wi-Fi Direct connection/discovery
 
         if (bluetoothAdapter?.isDiscovering == true) {
@@ -578,14 +594,15 @@ class DeviceListActivity : AppCompatActivity() {
     }
 
 
-    // --- BLE Permissions & Scan ---
+    // --- BLE Permissions & Scan / Advertise ---
     private fun checkBLEPermissions(): Boolean {
         val permissions = mutableListOf<String>()
         if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.S) {
             permissions.add(Manifest.permission.BLUETOOTH_SCAN)
             permissions.add(Manifest.permission.BLUETOOTH_CONNECT)
+            permissions.add(Manifest.permission.BLUETOOTH_ADVERTISE) // For server role
         }
-        permissions.add(Manifest.permission.ACCESS_FINE_LOCATION)
+        permissions.add(Manifest.permission.ACCESS_FINE_LOCATION) // Still needed for BLE scanning
 
         return permissions.all { ContextCompat.checkSelfPermission(this, it) == PackageManager.PERMISSION_GRANTED }
     }
@@ -595,6 +612,7 @@ class DeviceListActivity : AppCompatActivity() {
         if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.S) {
             if (!checkBluetoothScanPermission()) permissionsToRequest.add(Manifest.permission.BLUETOOTH_SCAN)
             if (!checkBluetoothConnectPermission()) permissionsToRequest.add(Manifest.permission.BLUETOOTH_CONNECT)
+            if (!BLEManager.hasBluetoothAdvertisePermission()) permissionsToRequest.add(Manifest.permission.BLUETOOTH_ADVERTISE) // For server role
         }
         if (ContextCompat.checkSelfPermission(this, Manifest.permission.ACCESS_FINE_LOCATION) != PackageManager.PERMISSION_GRANTED) permissionsToRequest.add(Manifest.permission.ACCESS_FINE_LOCATION)
 
@@ -602,7 +620,7 @@ class DeviceListActivity : AppCompatActivity() {
             requestPermissionLauncher.launch(permissionsToRequest.toTypedArray())
         } else {
             if (bluetoothAdapter?.isEnabled == true) {
-                startScanningBLE()
+                startScanningBLE() // This will now also start advertising
             } else {
                 promptEnableBluetooth()
             }
@@ -615,11 +633,14 @@ class DeviceListActivity : AppCompatActivity() {
         WifiDirectManager.disconnect() // Stop any active Wi-Fi Direct connection/discovery
 
         deviceAdapter.clearDevices()
-        binding.tvStatusMessage.text = "Scanning for BLE devices..."
+        binding.tvStatusMessage.text = "Scanning for BLE devices & Advertising..."
         binding.tvStatusMessage.visibility = View.VISIBLE
         binding.progressBarScanning.visibility = View.VISIBLE
 
-        BLEManager.startScan()
+        // Start both client scan and server advertising
+        BLEManager.startScan() // Client role: scan for other servers
+        BLEManager.startGattServer() // Server role: initialize and start GATT server
+        BLEManager.startAdvertising() // Server role: start advertising
     }
 
     // --- New: Wi-Fi Direct Permissions & Scan ---
@@ -658,7 +679,8 @@ class DeviceListActivity : AppCompatActivity() {
     private fun startScanningWifiDirect() {
         // Stop other scans
         stopScanning() // Stop Classic BT discovery
-        BLEManager.stopScan() // Stop BLE scan
+        BLEManager.stopScan() // Stop BLE client scan
+        BLEManager.stopAdvertising() // Stop BLE server advertising
 
         deviceAdapter.clearDevices()
         binding.tvStatusMessage.text = "Scanning for Wi-Fi Direct peers..."

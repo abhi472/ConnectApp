@@ -8,7 +8,7 @@
     <color name="black">#FF000000</color>
     <color name="white">#FFFFFFFF</color>
 
-    <!-- Custom colors for DayNight theme -->
-    <color name="black_or_white_text">#FF000000</color> <!-- Black text for light mode -->
-    <color name="white_or_dark_gray_background">#FFFFFFFF</color> <!-- White background for light mode -->
+    <!-- Custom colors for DayNight theme (dark mode) -->
+    <color name="black_or_white_text">#FFFFFFFF</color> <!-- White text for dark mode -->
+    <color name="white_or_dark_gray_background">#FF121212</color> <!-- Dark gray background for dark mode -->
 </resources>

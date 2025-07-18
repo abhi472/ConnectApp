@@ -18,7 +18,7 @@ import com.abhi.connectapp.databinding.ActivityMainBinding
 import com.abhi.connectapp.model.ConnectivityOption
 import com.abhi.connectapp.utils.Constants
 
-class MainActivity : ComponentActivity() {
+class MainActivity : AppCompatActivity() {
 
     private lateinit var binding: ActivityMainBinding
     private lateinit var requestPermissionLauncher: ActivityResultLauncher<Array<String>>
